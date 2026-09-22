@@ -34,8 +34,9 @@ source "$SCRIPT_DIR/lib/caveman.sh"
 # shellcheck source=lib/ponytail.sh
 source "$SCRIPT_DIR/lib/ponytail.sh"
 
-# caveman already owns :8787 as Claude Code's active compression proxy.
-# headroom gets its own port so both run side by side without a bind conflict.
+# caveman owns :8787 as the only proxy either agent's base URL points at.
+# headroom gets its own port and sits downstream of caveman in the chain
+# (agent -> caveman -> headroom -> provider) — see lib/caveman.sh.
 HEADROOM_PORT="${HEADROOM_PORT:-8788}"
 
 # cmd_kill — stops both persistent background proxies (caveman :8787,
@@ -73,8 +74,8 @@ main() {
   setup_caveman
   setup_ponytail
   section "done"
-  echo "  headroom → Codex routing + on-demand MCP in Claude Code, proxy on :$HEADROOM_PORT"
-  echo "  caveman  → owns Claude Code's proxy on :8787, native Codex integration"
+  echo "  caveman  → both agents' base URL, proxy on :8787, chains to headroom"
+  echo "  headroom → downstream compression hop on :$HEADROOM_PORT, on-demand MCP in Claude Code"
   echo "  rtk      → shell-output hook in both Claude Code and Codex"
   echo "  ponytail → plugin in both Claude Code and Codex"
   echo "  Just run 'claude' or 'codex' as usual — nothing else to launch."

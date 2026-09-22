@@ -73,35 +73,35 @@ check "profile_running: running but unhealthy still counts as running" \
 check_fail "profile_running: 'stopped' line containing the word running" \
   headroom_profile_running $'Profile:    default\nStatus:     stopped (was running before)'
 
-# --- codex_routed / mcp_registered -------------------------------------------
-check "codex_routed: config mentioning headroom"     headroom_codex_routed 'model_providers.headroom'
-check_fail "codex_routed: config with no mention"    headroom_codex_routed 'model_providers.openai'
-check_fail "codex_routed: empty config"              headroom_codex_routed ''
+# --- mcp_registered -----------------------------------------------------
 check "mcp_registered: list mentioning headroom"     headroom_mcp_registered 'headroom: /path/to/mcp -  Connected'
 check_fail "mcp_registered: list with no mention"    headroom_mcp_registered 'caveman: /path -  Connected'
 
-# --- rc_has_leaked_anthropic_url --------------------------------------------
-# Regression test for the real leak: `headroom init codex` wrote a shell rc
-# block that also exported ANTHROPIC_BASE_URL, shadowing caveman's Claude
-# Code routing for every new terminal.
-LEAKY_BLOCK=$'export PATH=/usr/bin\n\n# >>> headroom persistent env >>>\nexport HEADROOM_PORT="8788"\nexport ANTHROPIC_BASE_URL="http://127.0.0.1:8788"\nexport OPENAI_BASE_URL="http://127.0.0.1:8788/v1"\n# <<< headroom persistent env <<<\n'
-CLEAN_BLOCK=$'export PATH=/usr/bin\n\n# >>> headroom persistent env >>>\nexport HEADROOM_PORT="8788"\nexport OPENAI_BASE_URL="http://127.0.0.1:8788/v1"\n# <<< headroom persistent env <<<\n'
+# --- rc_has_leaked_base_url --------------------------------------------
+# Regression test for the real leak: the now-retired `headroom init codex`
+# routing step wrote a shell rc block that exported ANTHROPIC_BASE_URL and
+# OPENAI_BASE_URL, shadowing caveman's routing (both agents') for every new
+# terminal. Caveman is the only proxy either agent's base URL should name.
+LEAKY_BLOCK_ANTHROPIC=$'export PATH=/usr/bin\n\n# >>> headroom persistent env >>>\nexport HEADROOM_PORT="8788"\nexport ANTHROPIC_BASE_URL="http://127.0.0.1:8788"\n# <<< headroom persistent env <<<\n'
+LEAKY_BLOCK_OPENAI=$'export PATH=/usr/bin\n\n# >>> headroom persistent env >>>\nexport HEADROOM_PORT="8788"\nexport OPENAI_BASE_URL="http://127.0.0.1:8788/v1"\n# <<< headroom persistent env <<<\n'
+CLEAN_BLOCK=$'export PATH=/usr/bin\n\n# >>> headroom persistent env >>>\nexport HEADROOM_PORT="8788"\nexport HEADROOM_MODE="cache"\n# <<< headroom persistent env <<<\n'
 
-check "rc_has_leaked_anthropic_url: real leaky block"        headroom_rc_has_leaked_anthropic_url "$LEAKY_BLOCK"
-check_fail "rc_has_leaked_anthropic_url: cleaned-up block"   headroom_rc_has_leaked_anthropic_url "$CLEAN_BLOCK"
-check_fail "rc_has_leaked_anthropic_url: no headroom block at all" \
-  headroom_rc_has_leaked_anthropic_url 'export PATH=/usr/bin'
-# False positive guard: an ANTHROPIC_BASE_URL export OUTSIDE the headroom
-# block (e.g. hand-written by the user elsewhere in their rc file) is none
-# of this function's business and must not be flagged.
-check_fail "rc_has_leaked_anthropic_url: export outside the block is not our concern" \
-  headroom_rc_has_leaked_anthropic_url $'export ANTHROPIC_BASE_URL="http://elsewhere"\n\n# >>> headroom persistent env >>>\nexport HEADROOM_PORT="8788"\n# <<< headroom persistent env <<<\n'
+check "rc_has_leaked_base_url: real leaky block, ANTHROPIC_BASE_URL"  headroom_rc_has_leaked_base_url "$LEAKY_BLOCK_ANTHROPIC"
+check "rc_has_leaked_base_url: real leaky block, OPENAI_BASE_URL"     headroom_rc_has_leaked_base_url "$LEAKY_BLOCK_OPENAI"
+check_fail "rc_has_leaked_base_url: cleaned-up block"                 headroom_rc_has_leaked_base_url "$CLEAN_BLOCK"
+check_fail "rc_has_leaked_base_url: no headroom block at all" \
+  headroom_rc_has_leaked_base_url 'export PATH=/usr/bin'
+# False positive guard: a base-url export OUTSIDE the headroom block (e.g.
+# hand-written by the user elsewhere in their rc file) is none of this
+# function's business and must not be flagged.
+check_fail "rc_has_leaked_base_url: export outside the block is not our concern" \
+  headroom_rc_has_leaked_base_url $'export ANTHROPIC_BASE_URL="http://elsewhere"\n\n# >>> headroom persistent env >>>\nexport HEADROOM_PORT="8788"\n# <<< headroom persistent env <<<\n'
 # Reset guard: an unrelated export AFTER the closing marker must not count
 # either — this only passes if `inblock` actually resets to 0 at the closing
 # marker (a state machine that forgot to reset would let it leak through;
 # this is the after-the-block mirror of the ponytail insection bug above).
-check_fail "rc_has_leaked_anthropic_url: inblock must reset — an export after the closing marker doesn't count" \
-  headroom_rc_has_leaked_anthropic_url $'# >>> headroom persistent env >>>\nexport HEADROOM_PORT="8788"\n# <<< headroom persistent env <<<\n\nexport ANTHROPIC_BASE_URL="http://unrelated-user-line"\n'
+check_fail "rc_has_leaked_base_url: inblock must reset — an export after the closing marker doesn't count" \
+  headroom_rc_has_leaked_base_url $'# >>> headroom persistent env >>>\nexport HEADROOM_PORT="8788"\n# <<< headroom persistent env <<<\n\nexport ANTHROPIC_BASE_URL="http://unrelated-user-line"\n'
 
 # --- fix_rc_file (the actual file-editing side of the leak fix) ------------
 # These operate on a real temp file, not just text in a variable, since
@@ -112,12 +112,16 @@ tmp_rc="$(mktemp)"
 printf '%s' "$FIXTURE_LEAKY" > "$tmp_rc"
 headroom_fix_rc_file "$tmp_rc" >/dev/null
 fixed_text="$(cat "$tmp_rc")"
-check_fail "fix_rc_file: leak is actually gone after fixing"      headroom_rc_has_leaked_anthropic_url "$fixed_text"
+check_fail "fix_rc_file: leak is actually gone after fixing"      headroom_rc_has_leaked_base_url "$fixed_text"
 assert_contains "fix_rc_file: unrelated line before the block survives"   "$fixed_text" 'export PATH=/usr/bin'
-assert_contains "fix_rc_file: OPENAI_BASE_URL line survives"              "$fixed_text" 'export OPENAI_BASE_URL="http://127.0.0.1:8788/v1"'
 assert_contains "fix_rc_file: HEADROOM_PORT line survives"                "$fixed_text" 'export HEADROOM_PORT="8788"'
 assert_contains "fix_rc_file: unrelated line after the block survives"    "$fixed_text" 'export UNRELATED=1'
 assert_contains "fix_rc_file: block markers survive"                      "$fixed_text" '# >>> headroom persistent env >>>'
+case "$fixed_text" in
+  *OPENAI_BASE_URL*) TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    printf 'FAIL: fix_rc_file: OPENAI_BASE_URL line should be gone too\n' >&2 ;;
+  *) TESTS_RUN=$((TESTS_RUN + 1)) ;;
+esac
 rm -f "$tmp_rc"
 
 # Idempotency: running it again on an already-clean file changes nothing.
@@ -137,5 +141,31 @@ before_no_block="$(cat "$tmp_rc3")"
 headroom_fix_rc_file "$tmp_rc3" >/dev/null
 assert_eq "fix_rc_file: file without a headroom block is untouched" "$before_no_block" "$(cat "$tmp_rc3")"
 rm -f "$tmp_rc3"
+
+# --- fix_codex_config (retired Codex provider block cleanup) ----------------
+CODEX_FIXTURE=$'model_provider = "caveman"\n\n# --- Headroom init provider ---\nopenai_base_url = "http://127.0.0.1:8788/v1"\n\n[model_providers.headroom]\nname = "Headroom init proxy"\nbase_url = "http://127.0.0.1:8788/v1"\n# --- end Headroom init provider ---\n\n[features]\nhooks = true\n'
+tmp_codex="$(mktemp)"
+printf '%s' "$CODEX_FIXTURE" > "$tmp_codex"
+headroom_fix_codex_config "$tmp_codex" >/dev/null
+fixed_codex="$(cat "$tmp_codex")"
+case "$fixed_codex" in
+  *"Headroom init provider"*|*"model_providers.headroom"*)
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    printf 'FAIL: fix_codex_config: retired provider block should be gone\n' >&2 ;;
+  *) TESTS_RUN=$((TESTS_RUN + 1)) ;;
+esac
+assert_contains "fix_codex_config: unrelated model_provider line survives" "$fixed_codex" 'model_provider = "caveman"'
+assert_contains "fix_codex_config: unrelated features block survives" "$fixed_codex" 'hooks = true'
+headroom_fix_codex_config "$tmp_codex" >/dev/null
+assert_eq "fix_codex_config: running twice is a no-op the second time" "$fixed_codex" "$(cat "$tmp_codex")"
+rm -f "$tmp_codex"
+
+check "fix_codex_config: missing file is a silent no-op" headroom_fix_codex_config "/tmp/agent-tools-sync-test-does-not-exist.$$"
+tmp_codex2="$(mktemp)"
+printf 'model_provider = "caveman"\n' > "$tmp_codex2"
+before_no_provider_block="$(cat "$tmp_codex2")"
+headroom_fix_codex_config "$tmp_codex2" >/dev/null
+assert_eq "fix_codex_config: file without the retired block is untouched" "$before_no_provider_block" "$(cat "$tmp_codex2")"
+rm -f "$tmp_codex2"
 
 report

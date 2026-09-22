@@ -5,6 +5,7 @@
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/harness.sh"
+source "$HERE/../lib/common.sh"   # ssrf/patch functions below call ok()/warn()/run(), defined here
 source "$HERE/../lib/caveman.sh"
 
 REAL_STATUS=$'native integrations\nclaude     installed · newer_unknown · provider_proxy, session_start, mcp\ncodex      available · newer_unknown · local_runtime_available\nhermes     unavailable · unreported · local_runtime_available'
@@ -61,5 +62,69 @@ assert_eq "version_string: space-before-colon variant is NOT matched (documented
 # Fuzz: malformed JSON must not crash the extractor.
 assert_eq "version_string: malformed JSON -> empty, no crash" "" \
   "$(caveman_version_string '{not json at all')"
+
+# --- yaml_has_headroom_stack -------------------------------------------------
+STACKED_YAML=$'mode: compress\ncompat:\n  headroom:\n    base_url: http://127.0.0.1:8788\n    wire_dialect: anthropic\n'
+check "yaml_has_headroom_stack: real stacked config"        caveman_yaml_has_headroom_stack "$STACKED_YAML"
+check_fail "yaml_has_headroom_stack: empty file"             caveman_yaml_has_headroom_stack ""
+check_fail "yaml_has_headroom_stack: mode record, no compat" caveman_yaml_has_headroom_stack $'mode: record\n'
+check_fail "yaml_has_headroom_stack: compat mount but wrong port" \
+  caveman_yaml_has_headroom_stack $'mode: compress\ncompat:\n  headroom:\n    base_url: http://127.0.0.1:9999\n'
+check_fail "yaml_has_headroom_stack: right compat mount but mode still record" \
+  caveman_yaml_has_headroom_stack $'mode: record\ncompat:\n  headroom:\n    base_url: http://127.0.0.1:8788\n'
+
+# --- route_patched ------------------------------------------------------------
+tmp_settings_patched="$(mktemp)"
+printf '{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8787/compat/headroom"}}' > "$tmp_settings_patched"
+CAVEMAN_CLAUDE_SETTINGS="$tmp_settings_patched" check "route_patched: claude, patched settings.json" \
+  caveman_route_patched claude
+rm -f "$tmp_settings_patched"
+
+tmp_settings_native="$(mktemp)"
+printf '{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8787/w/claude"}}' > "$tmp_settings_native"
+CAVEMAN_CLAUDE_SETTINGS="$tmp_settings_native" check_fail "route_patched: claude, still on native /w/claude route" \
+  caveman_route_patched claude
+rm -f "$tmp_settings_native"
+
+check_fail "route_patched: unknown agent" caveman_route_patched gemini
+
+# --- ensure_ssrf_allowlist (real temp file) ----------------------------------
+tmp_rc="$(mktemp)"
+printf 'export PATH=/usr/bin\n' > "$tmp_rc"
+caveman_ensure_ssrf_allowlist "$tmp_rc" >/dev/null
+after_first="$(cat "$tmp_rc")"
+assert_contains "ensure_ssrf_allowlist: adds the allowlist export" "$after_first" 'CAVE_SSRF_ALLOWLIST="127.0.0.1:8788"'
+assert_contains "ensure_ssrf_allowlist: unrelated line survives" "$after_first" 'export PATH=/usr/bin'
+caveman_ensure_ssrf_allowlist "$tmp_rc" >/dev/null
+assert_eq "ensure_ssrf_allowlist: running twice is a no-op the second time" "$after_first" "$(cat "$tmp_rc")"
+rm -f "$tmp_rc"
+
+# --- patch_codex_route (real temp file, scoped to caveman's own block) ------
+CODEX_FIXTURE=$'model_provider = "caveman"\n\nopenai_base_url = "http://127.0.0.1:8788/v1"\n\n# >>> caveman:native-tables\n[model_providers.caveman]\nname = "Caveman"\nbase_url = "http://127.0.0.1:8787/chatgpt"\nwire_api = "responses"\n# <<< caveman:native-tables\n'
+tmp_codex="$(mktemp)"
+printf '%s' "$CODEX_FIXTURE" > "$tmp_codex"
+CAVEMAN_CODEX_CONFIG="$tmp_codex" caveman_patch_codex_route >/dev/null
+patched_codex="$(cat "$tmp_codex")"
+assert_contains "patch_codex_route: base_url repointed at compat/headroom" "$patched_codex" 'base_url = "http://127.0.0.1:8787/compat/headroom"'
+assert_contains "patch_codex_route: unrelated root base_url survives (dead but not this function's job)" \
+  "$patched_codex" 'openai_base_url = "http://127.0.0.1:8788/v1"'
+assert_contains "patch_codex_route: wire_api line survives" "$patched_codex" 'wire_api = "responses"'
+CAVEMAN_CODEX_CONFIG="$tmp_codex" caveman_patch_codex_route >/dev/null
+assert_eq "patch_codex_route: running twice is a no-op the second time" "$patched_codex" "$(cat "$tmp_codex")"
+rm -f "$tmp_codex"
+
+# --- patch_claude_route (real temp file, real node JSON patch) --------------
+if have node; then
+  CLAUDE_FIXTURE='{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8787/w/claude"},"other":"untouched"}'
+  tmp_settings="$(mktemp)"
+  printf '%s' "$CLAUDE_FIXTURE" > "$tmp_settings"
+  CAVEMAN_CLAUDE_SETTINGS="$tmp_settings" caveman_patch_claude_route >/dev/null
+  patched_settings="$(cat "$tmp_settings")"
+  assert_contains "patch_claude_route: env repointed at compat/headroom" "$patched_settings" '"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787/compat/headroom"'
+  assert_contains "patch_claude_route: unrelated top-level key survives" "$patched_settings" '"other": "untouched"'
+  CAVEMAN_CLAUDE_SETTINGS="$tmp_settings" caveman_patch_claude_route >/dev/null
+  assert_eq "patch_claude_route: running twice is a no-op the second time" "$patched_settings" "$(cat "$tmp_settings")"
+  rm -f "$tmp_settings"
+fi
 
 report

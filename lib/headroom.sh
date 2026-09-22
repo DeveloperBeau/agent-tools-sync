@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# headroom.sh — install/update headroom, wire Codex routing + Claude Code MCP,
-# run its persistent proxy on its own port (caveman already owns :8787).
+# headroom.sh — install/update headroom, wire its on-demand MCP server into
+# Claude Code, run its persistent proxy on its own port. Headroom is not
+# agent-facing: caveman (:8787) is the only proxy either agent's base URL
+# points at, chained to headroom (:8788) as the final hop before the real
+# provider — see caveman.sh's compat-mount setup. This used to also own
+# Codex's OPENAI_BASE_URL directly; that shadowed caveman's native Codex
+# integration entirely (Codex traffic never touched caveman), so it's gone —
+# headroom_rc_has_leaked_base_url()/headroom_fix_rc_file() below clean up the
+# stale env block a past run of this script left in shell rc files.
 #
 # Pure decision functions (headroom_*) take plain text and return a verdict;
 # they do no I/O and are what test/test_headroom.sh exercises directly.
@@ -61,22 +68,17 @@ headroom_deployment_action() {
   fi
 }
 
-# headroom_codex_routed CONFIG_TOML_TEXT — 0 if Codex's config.toml already
-# references headroom (durable routing already installed).
-headroom_codex_routed() {
-  printf '%s' "$1" | grep -qi 'headroom'
-}
-
-# headroom_rc_has_leaked_anthropic_url RC_TEXT — 0 if the "headroom
-# persistent env" block that `headroom init codex` writes into a shell rc
-# file still exports ANTHROPIC_BASE_URL. That line is a side effect of
-# wiring up Codex (which only needs OPENAI_BASE_URL) and would shadow
-# caveman's Claude Code routing in every new shell if left in place.
-headroom_rc_has_leaked_anthropic_url() {
+# headroom_rc_has_leaked_base_url RC_TEXT — 0 if a stale "headroom persistent
+# env" block (written by the retired `headroom init codex` routing step)
+# still exports ANTHROPIC_BASE_URL or OPENAI_BASE_URL. Either one, left in a
+# shell rc file, points an agent straight at headroom and skips caveman
+# entirely — caveman is now the only proxy either agent's base URL should
+# name.
+headroom_rc_has_leaked_base_url() {
   awk '
     /^# >>> headroom persistent env >>>/ { inblock=1 }
     /^# <<< headroom persistent env <<</ { inblock=0 }
-    inblock && /^export ANTHROPIC_BASE_URL=/ { found=1 }
+    inblock && /^export (ANTHROPIC|OPENAI)_BASE_URL=/ { found=1 }
     END { exit !found }
   ' <<<"$1"
 }
@@ -98,38 +100,43 @@ install_headroom() {
   fi
 }
 
-headroom_ensure_codex_routing() {
-  local cfg_text
-  cfg_text="$(cat "$HOME/.codex/config.toml" 2>/dev/null)"
-  if headroom_codex_routed "$cfg_text"; then
-    skip "Codex routing already configured"
-  elif run headroom init -g --port "$HEADROOM_PORT" codex; then
-    ok "Codex routing installed (port $HEADROOM_PORT)"
-  else
-    warn "Codex routing install failed"
-  fi
-  headroom_fix_rc_file "$HOME/.zshrc"
-  headroom_fix_rc_file "$HOME/.bashrc"
-}
-
-# headroom_fix_rc_file RC_PATH — strips a leaked ANTHROPIC_BASE_URL line
-# from headroom's block in RC_PATH, in place, leaving everything else in
-# the block (and the file) untouched. No-op if the file doesn't exist or
-# doesn't have the leak. Runs on every invocation, not just right after
-# `headroom init codex`, so it self-heals a leak from a past run too.
+# headroom_fix_rc_file RC_PATH — strips leaked ANTHROPIC_BASE_URL /
+# OPENAI_BASE_URL lines from headroom's block in RC_PATH, in place, leaving
+# everything else in the block (and the file) untouched. No-op if the file
+# doesn't exist or doesn't have the leak.
 headroom_fix_rc_file() {
   local rc="$1"
   [ -f "$rc" ] || return 0
-  headroom_rc_has_leaked_anthropic_url "$(cat "$rc")" || return 0
+  headroom_rc_has_leaked_base_url "$(cat "$rc")" || return 0
   local tmp
   tmp="$(mktemp)"
   awk '
     /^# >>> headroom persistent env >>>/ { inblock=1 }
     /^# <<< headroom persistent env <<</ { inblock=0 }
-    inblock && /^export ANTHROPIC_BASE_URL=/ { next }
+    inblock && /^export (ANTHROPIC|OPENAI)_BASE_URL=/ { next }
     { print }
   ' "$rc" > "$tmp" && mv "$tmp" "$rc"
-  warn "removed a shell-wide ANTHROPIC_BASE_URL that headroom's Codex setup had added to $rc (caveman owns Claude Code's routing)"
+  warn "removed shell-wide agent routing that pointed straight at headroom in $rc (caveman is the only proxy either agent's base URL should name)"
+}
+
+# headroom_fix_codex_config CONFIG_PATH — strips the retired "Headroom init
+# provider" block (root openai_base_url + model_providers.headroom) from
+# Codex's config.toml. Inert now that caveman owns Codex routing —
+# model_provider = "caveman" always wins — but stale unused config is still
+# worth cleaning up.
+headroom_fix_codex_config() {
+  local cfg="$1"
+  [ -f "$cfg" ] || return 0
+  grep -q '^# --- Headroom init provider ---$' "$cfg" 2>/dev/null || return 0
+  local tmp
+  tmp="$(mktemp)"
+  awk '
+    /^# --- Headroom init provider ---$/ { inblock=1; next }
+    /^# --- end Headroom init provider ---$/ { inblock=0; next }
+    inblock { next }
+    { print }
+  ' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+  warn "removed the retired Headroom Codex provider block from $cfg (caveman owns Codex routing)"
 }
 
 headroom_ensure_claude_mcp() {
@@ -203,7 +210,9 @@ setup_headroom() {
   else
     warn "update check failed or timed out"
   fi
-  headroom_ensure_codex_routing
+  headroom_fix_rc_file "$HOME/.zshrc"
+  headroom_fix_rc_file "$HOME/.bashrc"
+  headroom_fix_codex_config "$HOME/.codex/config.toml"
   headroom_ensure_claude_mcp
   headroom_ensure_proxy "$HEADROOM_PORT"
 }
