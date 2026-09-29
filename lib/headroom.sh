@@ -201,6 +201,7 @@ headroom_remove_legacy_profile() {
 }
 
 headroom_ensure_claude_mcp() {
+  have claude || { skip "Claude Code not installed — no MCP to register"; return; }
   local mcp_text
   mcp_text="$(claude mcp list 2>/dev/null)"
   if headroom_mcp_registered "$mcp_text"; then

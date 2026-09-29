@@ -15,8 +15,20 @@ Both tools are universal (each can wrap Claude Code, Codex, and a dozen other ag
 
 ## Install
 
+On macOS, download and run the bootstrap script in a terminal:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/DeveloperBeau/agent-tools-sync/v1.3.0/install.sh -o /tmp/agent-tools-sync-install.sh
+bash /tmp/agent-tools-sync-install.sh
+```
+
+The wizard installs Homebrew, Git, Node.js, Python, uv, and Bun when missing. It asks separately whether to install Claude Code and Codex; both default to no. It then clones ATS into `~/.local/share/agent-tools-sync`, adds `agent-tools-sync` to `~/.local/bin`, and runs the sync. Open a new terminal before using the command. Agent sign-in happens in each agent's own CLI.
+
+For a manual checkout instead:
+
 ```sh
 git clone https://github.com/DeveloperBeau/agent-tools-sync.git
+mkdir -p ~/.local/bin
 ln -s "$(pwd)/agent-tools-sync/agent-tools-sync.sh" ~/.local/bin/agent-tools-sync
 ```
 

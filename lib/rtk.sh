@@ -77,6 +77,6 @@ setup_rtk() {
   section "rtk"
   install_rtk
   have rtk || { warn "rtk not on PATH after install — skipping rest"; return; }
-  rtk_ensure_claude
-  rtk_ensure_codex
+  if have claude; then rtk_ensure_claude; fi
+  if have codex; then rtk_ensure_codex; fi
 }

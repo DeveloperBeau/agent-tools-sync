@@ -76,6 +76,6 @@ ponytail_ensure_codex() {
 
 setup_ponytail() {
   section "ponytail"
-  have claude && ponytail_ensure_claude
-  have codex && ponytail_ensure_codex
+  if have claude; then ponytail_ensure_claude; fi
+  if have codex; then ponytail_ensure_codex; fi
 }

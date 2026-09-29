@@ -61,6 +61,6 @@ setup_evolver() {
   section "evolver"
   install_evolver
   have evolver || { warn "evolver not on PATH after install — skipping rest"; return; }
-  evolver_ensure_claude
-  evolver_ensure_codex
+  if have claude; then evolver_ensure_claude; fi
+  if have codex; then evolver_ensure_codex; fi
 }

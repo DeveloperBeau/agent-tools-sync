@@ -235,16 +235,16 @@ setup_caveman() {
 
   local status_text
   status_text="$(caveman status 2>/dev/null)"
-  caveman_ensure_agent "$status_text" claude "Claude Code"
-  caveman_ensure_agent "$status_text" codex "Codex"
+  have claude && caveman_ensure_agent "$status_text" claude "Claude Code"
+  have codex && caveman_ensure_agent "$status_text" codex "Codex"
 
   caveman_ensure_ssrf_allowlist "$HOME/.zshrc"
   caveman_ensure_ssrf_allowlist "$HOME/.bashrc"
   export CAVE_SSRF_ALLOWLIST="${CAVE_SSRF_ALLOWLIST:-127.0.0.1:8788}"
 
   caveman_ensure_stack_config
-  caveman_patch_claude_route
-  caveman_patch_codex_route
+  have claude && caveman_patch_claude_route
+  have codex && caveman_patch_codex_route
 
   if pgrep -f caveman-proxy >/dev/null 2>&1; then
     ok "proxy already running on :8787"
