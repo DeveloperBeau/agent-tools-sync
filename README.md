@@ -18,7 +18,7 @@ Both tools are universal (each can wrap Claude Code, Codex, and a dozen other ag
 On macOS, download and run the bootstrap script in a terminal:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/DeveloperBeau/agent-tools-sync/v1.3.0/install.sh -o /tmp/agent-tools-sync-install.sh
+curl -fsSL https://raw.githubusercontent.com/DeveloperBeau/agent-tools-sync/main/install.sh -o /tmp/agent-tools-sync-install.sh
 bash /tmp/agent-tools-sync-install.sh
 ```
 
