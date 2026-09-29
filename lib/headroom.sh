@@ -286,6 +286,8 @@ headroom_stop_proxy() {
 
 setup_headroom() {
   section "headroom"
+  local previous_version="" current_version
+  have headroom && previous_version="$(headroom --version 2>/dev/null)"
   install_headroom
   have headroom || { warn "headroom not on PATH after install — skipping rest"; return; }
 
@@ -297,6 +299,11 @@ setup_headroom() {
   # a failed/timed-out check even when the real cause is a pending update.
   if run with_timeout 30 headroom update -y >/dev/null 2>&1; then
     ok "checked for updates"
+    current_version="$(headroom --version 2>/dev/null)"
+    if [ -n "$previous_version" ] && [ -n "$current_version" ] &&
+       [ "$previous_version" != "$current_version" ]; then
+      headroom_stop_proxy
+    fi
   else
     warn "update check failed or timed out"
   fi

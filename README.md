@@ -38,6 +38,8 @@ ats start      # bring both proxies back up, without the full sync
 
 `ats` and `ats start` check the Git checkout's upstream first. A clean checkout fast-forwards and restarts the updated script before integrations start. Offline, dirty, or diverged checkouts continue with their local version.
 
+During full sync, ATS checks tool updates before setup. When Headroom or Caveman changes version, ATS restarts its running proxy. CLI hooks use updated executables on their next invocation. Existing agent sessions and the claude-mem worker keep running.
+
 `ats kill` is a hard stop — nothing auto-restarts headroom's proxy afterward (unlike caveman, which self-starts on the next agent session). Since caveman chains every request through headroom, both agents get connection-refused on the last hop until you run `ats start` or `ats`.
 
 ## Testing

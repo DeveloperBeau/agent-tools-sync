@@ -216,8 +216,22 @@ caveman_patch_codex_route() {
 
 setup_caveman() {
   section "caveman"
+  local previous_version="" current_version
+  have caveman && previous_version="$(caveman --version 2>/dev/null)"
   install_caveman
   have caveman || { warn "caveman not on PATH after install — skipping rest"; return; }
+  current_version="$(caveman --version 2>/dev/null)"
+  if [ -n "$previous_version" ] && [ -n "$current_version" ] &&
+     [ "$previous_version" != "$current_version" ] &&
+     pgrep -f caveman-proxy >/dev/null 2>&1; then
+    caveman_stop_proxy
+    sleep 1
+    if pgrep -f caveman-proxy >/dev/null 2>&1; then
+      warn "updated proxy could not restart; old process still running"
+    else
+      caveman_start_proxy
+    fi
+  fi
 
   local status_text
   status_text="$(caveman status 2>/dev/null)"
