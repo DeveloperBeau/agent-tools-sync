@@ -4,6 +4,7 @@
 
 c_reset=$'\033[0m'; c_bold=$'\033[1m'; c_green=$'\033[32m'; c_yellow=$'\033[33m'
 c_red=$'\033[31m'; c_blue=$'\033[34m'
+ATS_VERSION=1.3.1
 
 section() { printf '\n%s== %s ==%s\n' "$c_bold$c_blue" "$1" "$c_reset"; }
 ok()      { printf '  %s✔%s %s\n' "$c_green" "$c_reset" "$1"; }
@@ -43,6 +44,7 @@ already_added_error() {
 # so the caller can restart with the newly fetched script and libraries.
 ats_check_update() {
   local dir="$1" root upstream remote branch behind
+  section "ats v$ATS_VERSION"
   have git || return 0
   dir="$(cd -P "$dir" && pwd)" || return 0
   root="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || return 0
@@ -50,7 +52,6 @@ ats_check_update() {
   upstream="$(git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)" || return 0
   remote="${upstream%%/*}"
   branch="${upstream#*/}"
-  section "ats"
   if ! with_timeout 15 env GIT_TERMINAL_PROMPT=0 git -C "$dir" fetch --quiet "$remote" "$branch"; then
     warn "update check failed; continuing with local version"
     return 0
