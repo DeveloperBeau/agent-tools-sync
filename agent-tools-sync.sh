@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # agent-tools-sync — install / update / wire up the local agent-efficiency
-# toolkit (headroom, rtk, caveman, ponytail) for both Claude Code and Codex.
+# toolkit (headroom, rtk, caveman, ponytail, optional Ship) for both agents.
 #
 # Safe to re-run any time: every step checks current state first and only
 # acts when something is actually missing or out of date.
@@ -44,6 +44,8 @@ source "$SCRIPT_DIR/lib/ponytail.sh"
 source "$SCRIPT_DIR/lib/evolver.sh"
 # shellcheck source=lib/claude-mem.sh
 source "$SCRIPT_DIR/lib/claude-mem.sh"
+# shellcheck source=lib/ship.sh
+source "$SCRIPT_DIR/lib/ship.sh"
 
 # caveman owns :8787 as the only proxy either agent's base URL points at.
 # headroom gets its own port and sits downstream of caveman in the chain
@@ -89,6 +91,7 @@ main() {
   setup_ponytail
   setup_evolver
   setup_claude_mem
+  setup_ship
   section "done"
   echo "  caveman    → both agents' base URL, proxy on :8787, chains to headroom"
   echo "  headroom   → downstream compression hop on :$HEADROOM_PORT, on-demand MCP in Claude Code"
@@ -96,6 +99,7 @@ main() {
   echo "  ponytail   → plugin in both Claude Code and Codex"
   echo "  evolver    → session hooks in both Claude Code and Codex"
   echo "  claude-mem → cross-session memory plugin in both, worker daemon on its own port"
+  echo "  ship       → optional private plugin in both agents"
   echo "  Just run 'claude' or 'codex' as usual — nothing else to launch."
 }
 
