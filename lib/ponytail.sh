@@ -53,7 +53,7 @@ ponytail_ensure_codex() {
   local cfg_text
   cfg_text="$(cat "$HOME/.codex/config.toml" 2>/dev/null)"
   if ponytail_codex_installed "$cfg_text"; then
-    if run codex plugin marketplace upgrade >/dev/null 2>&1 &&
+    if run codex plugin marketplace upgrade ponytail >/dev/null 2>&1 &&
        run codex plugin add ponytail@ponytail >/dev/null 2>&1; then
       ok "Codex plugin present, refreshed"
     else

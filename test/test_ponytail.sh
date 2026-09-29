@@ -58,6 +58,20 @@ check_fail "codex_installed: random fuzz text" \
 check_fail "codex_installed: spaced-out section header is NOT matched (documented boundary)" \
   ponytail_codex_installed $'[ plugins."ponytail@ponytail" ]\nenabled = true\n'
 
+codex_refresh_scoped() (
+  local HOME call_log calls
+  HOME="$(mktemp -d)"
+  mkdir "$HOME/.codex"
+  printf '%s\n' "$REAL_CODEX_TOML" >"$HOME/.codex/config.toml"
+  call_log="$HOME/calls"
+  run() { printf '%s\n' "$*" >>"$call_log"; }
+  ponytail_ensure_codex
+  calls="$(cat "$call_log")"
+  rm -r "$HOME"
+  [ "$calls" = $'codex plugin marketplace upgrade ponytail\ncodex plugin add ponytail@ponytail' ]
+)
+check "codex refresh: only ponytail marketplace upgraded" codex_refresh_scoped
+
 # --- already_added_error ------------------------------------------------------
 check "already_added_error: real codex error text" already_added_error \
   "Error: marketplace 'ponytail' is already added from a different source; remove it before adding this source"
