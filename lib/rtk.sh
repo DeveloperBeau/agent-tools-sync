@@ -32,7 +32,16 @@ install_rtk() {
   else
     ok "installed ($(rtk --version 2>/dev/null))"
     if brew list rtk >/dev/null 2>&1; then
-      run brew upgrade rtk || skip "already up to date"
+      # brew upgrade on an already-latest formula exits 0 and just prints a
+      # "Warning: already installed" — the || never fires, so check first
+      # instead of letting that noise through on every run. brew outdated
+      # itself always exits 0; outdated-ness is conveyed by non-empty
+      # output, not the exit code.
+      if [ -n "$(brew outdated rtk 2>/dev/null)" ]; then
+        run brew upgrade rtk
+      else
+        skip "already up to date"
+      fi
     else
       run bash -c "curl -fsSL '$RTK_INSTALL_URL' | sh"
     fi

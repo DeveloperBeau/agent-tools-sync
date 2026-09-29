@@ -56,8 +56,28 @@ mutant lib/headroom.sh test/test_headroom.sh \
 
 mutant lib/headroom.sh test/test_headroom.sh \
   "fix_rc_file: stop actually skipping the leaked line (rewrite becomes a no-op)" \
-  'inblock && /^export ANTHROPIC_BASE_URL=/ { next }' \
-  'inblock && /^export ANTHROPIC_BASE_URL=/ { }'
+  'inblock && /^export (ANTHROPIC|OPENAI)_BASE_URL=/ { next }' \
+  'inblock && /^export (ANTHROPIC|OPENAI)_BASE_URL=/ { }'
+
+mutant lib/headroom.sh test/test_headroom.sh \
+  "manifest_routes_agents: loosen to any key containing BASE_URL" \
+  "grep -qE '\"(ANTHROPIC|OPENAI)_BASE_URL\"'" \
+  "grep -q 'BASE_URL'"
+
+mutant lib/headroom.sh test/test_headroom.sh \
+  "manifest_routes_agents: watch only the claude half of the leak" \
+  "grep -qE '\"(ANTHROPIC|OPENAI)_BASE_URL\"'" \
+  "grep -qE '\"ANTHROPIC_BASE_URL\"'"
+
+mutant lib/headroom.sh test/test_headroom.sh \
+  "effective_action: drop the manifest override (leak survives every start)" \
+  'if [ "$1" != reapply ] && headroom_manifest_routes_agents "$2"; then' \
+  'if [ "$1" != reapply ] && false; then'
+
+mutant lib/headroom.sh test/test_headroom.sh \
+  "effective_action: override everything, not just leaky manifests" \
+  'if [ "$1" != reapply ] && headroom_manifest_routes_agents "$2"; then' \
+  'if [ "$1" != reapply ]; then'
 
 # --------------------------------------------------------------------- rtk --
 mutant lib/rtk.sh test/test_rtk.sh \
@@ -102,10 +122,26 @@ mutant lib/ponytail.sh test/test_ponytail.sh \
   'insection && /enabled[ \t]*=[ \t]*true/ { found=1 }' \
   'insection && /enabled[ \t]*=[ \t]*(true|false)/ { found=1 }'
 
-mutant lib/ponytail.sh test/test_ponytail.sh \
+mutant lib/common.sh test/test_ponytail.sh \
   "already_added_error: search for a phrase that never appears" \
   "grep -qi 'already added'" \
   "grep -qi 'zzz-never-matches-zzz'"
+
+# ----------------------------------------------------------------- evolver --
+mutant lib/evolver.sh test/test_evolver.sh \
+  "codex_hook_installed: loosen to a bare mention of evolver" \
+  "grep -q 'evolver-managed-hook'" \
+  "grep -q 'evolver'"
+
+mutant lib/evolver.sh test/test_evolver.sh \
+  "codex_hook_installed: go back to probing the hooks.json path" \
+  "grep -q 'evolver-managed-hook'" \
+  "grep -q '\\.codex/hooks/evolver/'"
+
+mutant lib/evolver.sh test/test_evolver.sh \
+  "claude_hook_installed: loosen to a bare mention of evolver" \
+  "grep -q '\\.claude/hooks/evolver/'" \
+  "grep -q 'evolver'"
 
 # ------------------------------------------------------------------ runner --
 killed=0 survived=0 skipped=0

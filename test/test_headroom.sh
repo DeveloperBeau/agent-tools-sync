@@ -77,6 +77,27 @@ check_fail "profile_running: 'stopped' line containing the word running" \
 check "mcp_registered: list mentioning headroom"     headroom_mcp_registered 'headroom: /path/to/mcp -  Connected'
 check_fail "mcp_registered: list with no mention"    headroom_mcp_registered 'caveman: /path -  Connected'
 
+# --- legacy Codex init hook cleanup -----------------------------------------
+# `headroom init codex` installs an on-demand init-user profile on the same
+# port ATS owns with its default profile. That hook can stop/restart :8788
+# underneath caveman, producing 502s while no upstream is listening.
+tmp_hooks="$(mktemp)"
+printf '%s\n' '{"hooks":{"SessionStart":[{"matcher":"startup|resume","hooks":[{"type":"command","command":"/Users/test/.local/bin/headroom init hook ensure --profile init-user --marker headroom-init-codex","timeout":15},{"type":"command","command":"keep-session"}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"headroom init hook ensure --profile init-user --marker headroom-init-codex"}]},{"hooks":[{"type":"command","command":"keep-pretool"}]}]}}' > "$tmp_hooks"
+headroom_fix_codex_hooks "$tmp_hooks" >/dev/null
+fixed_hooks="$(cat "$tmp_hooks")"
+case "$fixed_hooks" in
+  *"headroom init hook ensure"*)
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    printf 'FAIL: fix_codex_hooks: legacy init-user hook should be gone\n' >&2 ;;
+  *) TESTS_RUN=$((TESTS_RUN + 1)) ;;
+esac
+assert_contains "fix_codex_hooks: unrelated SessionStart hook survives" "$fixed_hooks" 'keep-session'
+assert_contains "fix_codex_hooks: unrelated PreToolUse hook survives" "$fixed_hooks" 'keep-pretool'
+before_hooks_second_pass="$fixed_hooks"
+headroom_fix_codex_hooks "$tmp_hooks" >/dev/null
+assert_eq "fix_codex_hooks: running twice is a no-op" "$before_hooks_second_pass" "$(cat "$tmp_hooks")"
+rm -f "$tmp_hooks"
+
 # --- rc_has_leaked_base_url --------------------------------------------
 # Regression test for the real leak: the now-retired `headroom init codex`
 # routing step wrote a shell rc block that exported ANTHROPIC_BASE_URL and
@@ -102,6 +123,70 @@ check_fail "rc_has_leaked_base_url: export outside the block is not our concern"
 # this is the after-the-block mirror of the ponytail insection bug above).
 check_fail "rc_has_leaked_base_url: inblock must reset — an export after the closing marker doesn't count" \
   headroom_rc_has_leaked_base_url $'# >>> headroom persistent env >>>\nexport HEADROOM_PORT="8788"\n# <<< headroom persistent env <<<\n\nexport ANTHROPIC_BASE_URL="http://unrelated-user-line"\n'
+
+# --- manifest_routes_agents (why the rc leak kept coming back) -------------
+# fix_rc_file only cleans the symptom. The cause is the stored deployment
+# manifest: applied with --providers auto/all it carries tool_envs, and every
+# `install apply|start|restart` rewrites the shell block from it, so the leak
+# returns on the next start. This is the probe that forces a manual reapply.
+LEAKY_MANIFEST='{"provider_mode":"auto","targets":["claude","codex"],"tool_envs":{"claude":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8788"},"codex":{"OPENAI_BASE_URL":"http://127.0.0.1:8788/v1"}}}'
+CLEAN_MANIFEST='{"provider_mode":"manual","targets":[],"tool_envs":{},"base_env":{"HEADROOM_PORT":"8788"},"health_url":"http://127.0.0.1:8788/readyz"}'
+
+check "manifest_routes_agents: auto-providers manifest with tool_envs" \
+  headroom_manifest_routes_agents "$LEAKY_MANIFEST"
+check_fail "manifest_routes_agents: manual-providers manifest"        headroom_manifest_routes_agents "$CLEAN_MANIFEST"
+check_fail "manifest_routes_agents: missing manifest reads as empty"  headroom_manifest_routes_agents ""
+# A manifest that only mentions headroom's own URLs (health_url, base_env)
+# must not be mistaken for agent routing.
+check_fail "manifest_routes_agents: headroom's own urls are not agent routing" \
+  headroom_manifest_routes_agents '{"health_url":"http://127.0.0.1:8788/readyz","image":"ghcr.io/x:latest"}'
+# False positive guard: an unrelated key that merely ends in BASE_URL is not
+# agent routing — only the two keys headroom writes into a shell rc file are.
+check_fail "manifest_routes_agents: a lookalike key ending in BASE_URL" \
+  headroom_manifest_routes_agents '{"extra_env":{"SOME_BASE_URL":"http://x","ANTHROPIC_TARGET_API_URL":"http://y"}}'
+# False negative guard: the leak counts wherever it sits in the manifest —
+# a hand-edited manifest can carry it in extra_env / base_env, not tool_envs.
+check "manifest_routes_agents: leak in base_env, not tool_envs" \
+  headroom_manifest_routes_agents '{"base_env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8788"},"tool_envs":{}}'
+check "manifest_routes_agents: openai side alone still counts" \
+  headroom_manifest_routes_agents '{"tool_envs":{"codex":{"OPENAI_BASE_URL":"http://127.0.0.1:8788/v1"}}}'
+# Fuzz: random bytes are neither a manifest nor a reason to reapply, and must
+# never crash the probe.
+MANIFEST_FUZZ="$(head -c 400 /dev/urandom | base64)"
+check_fail "manifest_routes_agents: random fuzz text never reads as leaking" \
+  headroom_manifest_routes_agents "$MANIFEST_FUZZ"
+check_fail "manifest_routes_agents: truncated json never reads as leaking" \
+  headroom_manifest_routes_agents '{"provider_mode":"man'
+# Fuzz, other direction: garbage *wrapped around* a real leak must still be
+# caught — a manifest half-written by an interrupted apply is the real case.
+check "manifest_routes_agents: leak survives surrounding garbage" \
+  headroom_manifest_routes_agents "$MANIFEST_FUZZ"'{"tool_envs":{"claude":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8788"}}'"$MANIFEST_FUZZ"
+
+# --- effective_action (the seam that turns the probe into a reapply) --------
+# The whole data flow: status text -> deployment_action -> effective_action.
+# A leaky manifest must override every non-reapply verdict; a clean one must
+# change nothing at all.
+assert_eq "effective_action: healthy + leaky manifest -> reapply" \
+  reapply "$(headroom_effective_action healthy "$LEAKY_MANIFEST")"
+assert_eq "effective_action: start + leaky manifest -> reapply" \
+  reapply "$(headroom_effective_action start "$LEAKY_MANIFEST")"
+assert_eq "effective_action: reapply + leaky manifest stays reapply" \
+  reapply "$(headroom_effective_action reapply "$LEAKY_MANIFEST")"
+assert_eq "effective_action: healthy + clean manifest is left alone" \
+  healthy "$(headroom_effective_action healthy "$CLEAN_MANIFEST")"
+assert_eq "effective_action: start + clean manifest is left alone" \
+  start "$(headroom_effective_action start "$CLEAN_MANIFEST")"
+assert_eq "effective_action: missing manifest is left alone" \
+  healthy "$(headroom_effective_action healthy "")"
+assert_eq "effective_action: fuzz manifest is left alone" \
+  healthy "$(headroom_effective_action healthy "$MANIFEST_FUZZ")"
+# End to end over the real status text the port-reuse tests use: a healthy
+# profile on the right port normally means "do nothing", and must not once
+# the manifest is leaky.
+assert_eq "effective_action: end to end, healthy status + leaky manifest -> reapply" \
+  reapply "$(headroom_effective_action "$(headroom_deployment_action "$REAL_RUNNING" 8788)" "$LEAKY_MANIFEST")"
+assert_eq "effective_action: end to end, healthy status + clean manifest -> healthy" \
+  healthy "$(headroom_effective_action "$(headroom_deployment_action "$REAL_RUNNING" 8788)" "$CLEAN_MANIFEST")"
 
 # --- fix_rc_file (the actual file-editing side of the leak fix) ------------
 # These operate on a real temp file, not just text in a variable, since

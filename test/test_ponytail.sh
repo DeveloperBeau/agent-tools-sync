@@ -7,6 +7,7 @@
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/harness.sh"
+source "$HERE/../lib/common.sh"   # already_added_error lives here, shared with claude-mem.sh
 source "$HERE/../lib/ponytail.sh"
 
 REAL_CLAUDE_LIST=$'Installed plugins:\n\n  ❯ ponytail@ponytail\n    Version: 4.9.0\n    Scope: user\n    Status: ✔ enabled'

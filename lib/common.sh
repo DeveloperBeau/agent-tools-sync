@@ -31,3 +31,47 @@ with_timeout() {
 port_listening() {
   lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
 }
+
+# already_added_error TEXT — 0 if TEXT looks like a "marketplace already
+# exists" error rather than a real failure. Shared by every plugin-based
+# install (ponytail, claude-mem) that adds a marketplace before installing.
+already_added_error() {
+  printf '%s' "$1" | grep -qi 'already added'
+}
+
+# Refresh this checkout before loading integrations. Return 2 after an update
+# so the caller can restart with the newly fetched script and libraries.
+ats_check_update() {
+  local dir="$1" root upstream remote branch behind
+  have git || return 0
+  dir="$(cd -P "$dir" && pwd)" || return 0
+  root="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || return 0
+  [ "$root" = "$dir" ] || return 0
+  upstream="$(git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)" || return 0
+  remote="${upstream%%/*}"
+  branch="${upstream#*/}"
+  section "ats"
+  if ! with_timeout 15 env GIT_TERMINAL_PROMPT=0 git -C "$dir" fetch --quiet "$remote" "$branch"; then
+    warn "update check failed; continuing with local version"
+    return 0
+  fi
+  behind="$(git -C "$dir" rev-list --count "HEAD..$upstream")" || return 0
+  if [ "$behind" -eq 0 ]; then
+    ok "already up to date"
+    return 0
+  fi
+  if ! git -C "$dir" merge-base --is-ancestor HEAD "$upstream"; then
+    warn "local branch diverged; update manually"
+    return 0
+  fi
+  if [ -n "$(git -C "$dir" status --porcelain)" ]; then
+    warn "update available; commit local changes before updating"
+    return 0
+  fi
+  if git -C "$dir" merge --ff-only --quiet "$upstream"; then
+    ok "updated from $upstream"
+    return 2
+  fi
+  warn "update failed; continuing with local version"
+  return 0
+}

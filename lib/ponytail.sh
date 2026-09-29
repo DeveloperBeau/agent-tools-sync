@@ -24,19 +24,16 @@ ponytail_codex_installed() {
   ' <<<"$1"
 }
 
-# already_added_error TEXT — 0 if TEXT looks like a "marketplace already
-# exists" error rather than a real failure.
-already_added_error() {
-  printf '%s' "$1" | grep -qi 'already added'
-}
-
 ponytail_ensure_claude() {
   local list_text
   list_text="$(claude plugin list 2>/dev/null)"
   if ponytail_claude_installed "$list_text"; then
-    run claude plugin marketplace update ponytail >/dev/null 2>&1
-    run claude plugin update ponytail@ponytail >/dev/null 2>&1
-    ok "Claude Code plugin present, refreshed"
+    if run claude plugin marketplace update ponytail >/dev/null 2>&1 &&
+       run claude plugin update ponytail@ponytail >/dev/null 2>&1; then
+      ok "Claude Code plugin present, refreshed"
+    else
+      warn "Claude Code plugin update failed"
+    fi
     return
   fi
   local add_out
@@ -56,9 +53,12 @@ ponytail_ensure_codex() {
   local cfg_text
   cfg_text="$(cat "$HOME/.codex/config.toml" 2>/dev/null)"
   if ponytail_codex_installed "$cfg_text"; then
-    run codex plugin marketplace upgrade >/dev/null 2>&1
-    run codex plugin add ponytail@ponytail >/dev/null 2>&1
-    ok "Codex plugin present, refreshed"
+    if run codex plugin marketplace upgrade >/dev/null 2>&1 &&
+       run codex plugin add ponytail@ponytail >/dev/null 2>&1; then
+      ok "Codex plugin present, refreshed"
+    else
+      warn "Codex plugin update failed"
+    fi
     return
   fi
   local add_out

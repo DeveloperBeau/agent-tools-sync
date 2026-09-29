@@ -14,6 +14,8 @@
 # The install_headroom()/headroom_ensure_proxy() functions below them are the
 # thin, side-effecting orchestration layer built on top.
 
+HEADROOM_MANIFEST="${HEADROOM_MANIFEST:-$HOME/.headroom/deploy/default/manifest.json}"
+
 # headroom_profile_exists STATUS_TEXT — 0 if `install status` returned a real
 # profile block, 1 if it returned the "no such profile" error.
 headroom_profile_exists() {
@@ -83,6 +85,31 @@ headroom_rc_has_leaked_base_url() {
   ' <<<"$1"
 }
 
+# headroom_manifest_routes_agents MANIFEST_JSON — 0 if the stored deployment
+# manifest still carries per-agent routing env (tool_envs), i.e. it was applied
+# with --providers auto/all. This is the *source* of the rc leak that
+# headroom_fix_rc_file cleans up: every `install apply|start|restart` re-writes
+# the shell block from the manifest, so stripping the rc file alone is
+# whack-a-mole — the next start puts ANTHROPIC_BASE_URL / OPENAI_BASE_URL
+# straight back. A manual-providers manifest has no tool_envs and stays clean.
+headroom_manifest_routes_agents() {
+  printf '%s' "$1" | grep -qE '"(ANTHROPIC|OPENAI)_BASE_URL"'
+}
+
+# headroom_effective_action ACTION MANIFEST_JSON — the proxy step's final
+# verdict: ACTION as decided from `install status`, upgraded to "reapply" when
+# the stored manifest still routes agents. Reapplying is what actually ends the
+# leak: `install remove` reverts the shell block, and the apply that follows
+# passes --providers manual, so the manifest it writes has no tool_envs to
+# re-leak on the next start.
+headroom_effective_action() {
+  if [ "$1" != reapply ] && headroom_manifest_routes_agents "$2"; then
+    echo reapply
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
 # headroom_mcp_registered MCP_LIST_TEXT — 0 if `claude mcp list` already
 # shows a headroom entry.
 headroom_mcp_registered() {
@@ -139,6 +166,40 @@ headroom_fix_codex_config() {
   warn "removed the retired Headroom Codex provider block from $cfg (caveman owns Codex routing)"
 }
 
+# Remove Headroom's older on-demand init-user hooks. ATS owns one persistent
+# profile on :8788; leaving these hooks installed lets a second profile stop or
+# seize that same port underneath caveman, which surfaces as proxy 502s.
+headroom_fix_codex_hooks() {
+  local hooks="$1"
+  [ -f "$hooks" ] || return 0
+  grep -q 'headroom init hook ensure --profile init-user' "$hooks" 2>/dev/null || return 0
+  run node -e '
+    const fs = require("fs");
+    const path = process.argv[1];
+    const data = JSON.parse(fs.readFileSync(path, "utf8"));
+    for (const event of Object.keys(data.hooks || {})) {
+      data.hooks[event] = data.hooks[event]
+        .map(group => ({ ...group, hooks: (group.hooks || []).filter(hook =>
+          !String(hook.command || "").includes("headroom init hook ensure --profile init-user")) }))
+        .filter(group => group.hooks.length);
+    }
+    fs.writeFileSync(path, JSON.stringify(data, null, 2) + "\n");
+  ' "$hooks" >/dev/null
+  warn "removed retired Headroom init-user hooks from $hooks"
+}
+
+headroom_remove_legacy_profile() {
+  local status
+  status="$(headroom install status --profile init-user 2>&1)"
+  headroom_profile_exists "$status" || return 0
+  run headroom install stop --profile init-user >/dev/null 2>&1 || true
+  if run headroom install remove --profile init-user >/dev/null 2>&1; then
+    warn "removed retired Headroom init-user profile"
+  else
+    warn "failed to remove retired Headroom init-user profile"
+  fi
+}
+
 headroom_ensure_claude_mcp() {
   local mcp_text
   mcp_text="$(claude mcp list 2>/dev/null)"
@@ -151,17 +212,42 @@ headroom_ensure_claude_mcp() {
   fi
 }
 
+# headroom's own `mcp install` has a Claude Code registrar only ("Cursor /
+# Codex / Continue / others added in subsequent releases"), so Codex gets the
+# same stdio server registered through Codex's own CLI instead.
+headroom_ensure_codex_mcp() {
+  have codex || { skip "codex not installed — no MCP to register"; return; }
+  local mcp_text
+  mcp_text="$(codex mcp list 2>/dev/null)"
+  if headroom_mcp_registered "$mcp_text"; then
+    skip "MCP already registered with Codex"
+  elif run codex mcp add headroom \
+         --env "HEADROOM_PROXY_URL=http://127.0.0.1:$HEADROOM_PORT" \
+         -- headroom mcp serve; then
+    ok "MCP registered with Codex"
+  else
+    warn "MCP registration with Codex failed"
+  fi
+}
+
 # headroom_ensure_proxy PORT — profile named "default", runtime=python
 # (persistent-docker was tried and never reports healthy in this
 # environment — see plans/agent-tools-sync notes; python runtime works).
 headroom_ensure_proxy() {
-  local port="$1" status
+  local port="$1" status action effective
   status="$(headroom install status --profile default 2>&1)"
-  case "$(headroom_deployment_action "$status" "$port")" in
+  action="$(headroom_deployment_action "$status" "$port")"
+  effective="$(headroom_effective_action "$action" \
+                 "$(cat "$HEADROOM_MANIFEST" 2>/dev/null)")"
+  if [ "$effective" != "$action" ]; then
+    warn "deployment manifest still routes agents at headroom — reapplying with --providers manual"
+  fi
+  case "$effective" in
     reapply)
       run headroom install remove --profile default >/dev/null 2>&1
       if run headroom install apply --profile default --port "$port" \
              --scope user --preset persistent-service --runtime python \
+             --providers manual \
         && run headroom install start --profile default; then
         ok "proxy installed and started on :$port"
       else
@@ -205,7 +291,11 @@ setup_headroom() {
 
   # Bounded: this hits the network, and headroom has been observed to hang
   # here for 5+ minutes with nothing but Ctrl-C to escape.
-  if run with_timeout 30 headroom update >/dev/null 2>&1; then
+  # -y: `headroom update` prompts "Proceed with the upgrade? [Y/n]" when a
+  # newer release exists; non-interactive stdin here can't answer it, so
+  # without -y this always hangs to the with_timeout bound and reports as
+  # a failed/timed-out check even when the real cause is a pending update.
+  if run with_timeout 30 headroom update -y >/dev/null 2>&1; then
     ok "checked for updates"
   else
     warn "update check failed or timed out"
@@ -213,6 +303,9 @@ setup_headroom() {
   headroom_fix_rc_file "$HOME/.zshrc"
   headroom_fix_rc_file "$HOME/.bashrc"
   headroom_fix_codex_config "$HOME/.codex/config.toml"
+  headroom_fix_codex_hooks "$HOME/.codex/hooks.json"
+  headroom_remove_legacy_profile
   headroom_ensure_claude_mcp
+  headroom_ensure_codex_mcp
   headroom_ensure_proxy "$HEADROOM_PORT"
 }

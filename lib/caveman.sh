@@ -57,11 +57,16 @@ caveman_route_patched() {
 }
 
 install_caveman() {
+  # --allow-scripts=pnpm: scoped to this command only (not written to global
+  # npm config) so @caveman-ai/cli's pnpm dependency can run its own
+  # postinstall. A persistent global allow-scripts entry instead breaks
+  # unrelated project-scoped npm installs elsewhere — see claude-mem's
+  # Codex plugin install, which hit exactly that.
   if ! have caveman; then
-    run npm install -g @caveman-ai/cli
+    run npm install -g @caveman-ai/cli --allow-scripts=pnpm
   else
     ok "installed ($(caveman_version_string "$(caveman --version 2>/dev/null)"))"
-    run npm update -g @caveman-ai/cli >/dev/null
+    run npm update -g @caveman-ai/cli --allow-scripts=pnpm >/dev/null
   fi
 }
 
@@ -70,7 +75,7 @@ caveman_ensure_agent() {
   if caveman_agent_installed "$status_text" "$agent"; then
     skip "$label integration already installed"
   elif caveman_route_patched "$agent"; then
-    skip "$label integration reports degraded — expected, its route is patched to chain through headroom"
+    skip "$label integration active through headroom"
   elif run caveman enable "$agent"; then
     ok "$label integration installed"
   else

@@ -25,6 +25,13 @@ unset _src _dir
 
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
+if [ "${1:-}" != kill ]; then
+  if ats_check_update "$SCRIPT_DIR"; then
+    :
+  elif [ "$?" -eq 2 ]; then
+    exec "$SCRIPT_DIR/agent-tools-sync.sh" "$@"
+  fi
+fi
 # shellcheck source=lib/headroom.sh
 source "$SCRIPT_DIR/lib/headroom.sh"
 # shellcheck source=lib/rtk.sh
@@ -33,18 +40,24 @@ source "$SCRIPT_DIR/lib/rtk.sh"
 source "$SCRIPT_DIR/lib/caveman.sh"
 # shellcheck source=lib/ponytail.sh
 source "$SCRIPT_DIR/lib/ponytail.sh"
+# shellcheck source=lib/evolver.sh
+source "$SCRIPT_DIR/lib/evolver.sh"
+# shellcheck source=lib/claude-mem.sh
+source "$SCRIPT_DIR/lib/claude-mem.sh"
 
 # caveman owns :8787 as the only proxy either agent's base URL points at.
 # headroom gets its own port and sits downstream of caveman in the chain
 # (agent -> caveman -> headroom -> provider) — see lib/caveman.sh.
 HEADROOM_PORT="${HEADROOM_PORT:-8788}"
 
-# cmd_kill — stops both persistent background proxies (caveman :8787,
-# headroom :$HEADROOM_PORT) and confirms neither port is still listening.
+# cmd_kill — stops all persistent background servers (caveman :8787,
+# headroom :$HEADROOM_PORT, claude-mem's worker daemon) and confirms neither
+# fixed-port proxy is still listening.
 cmd_kill() {
   section "kill"
   caveman_stop_proxy
   headroom_stop_proxy
+  claude_mem_stop_worker
 
   sleep 1  # give the sockets a moment to actually release
   local alive=0
@@ -53,12 +66,13 @@ cmd_kill() {
   [ "$alive" -eq 0 ] && ok "no agent-tools servers listening on 8787 or $HEADROOM_PORT"
 }
 
-# cmd_start — brings both proxies back up without the full rtk/caveman-agent
-# /ponytail sync. The counterpart to cmd_kill.
+# cmd_start — brings all background servers back up without the full
+# rtk/caveman-agent/ponytail sync. The counterpart to cmd_kill.
 cmd_start() {
   section "start"
   caveman_start_proxy
   headroom_ensure_proxy "$HEADROOM_PORT"
+  claude_mem_start_worker
 }
 
 main() {
@@ -73,11 +87,15 @@ main() {
   setup_rtk
   setup_caveman
   setup_ponytail
+  setup_evolver
+  setup_claude_mem
   section "done"
-  echo "  caveman  → both agents' base URL, proxy on :8787, chains to headroom"
-  echo "  headroom → downstream compression hop on :$HEADROOM_PORT, on-demand MCP in Claude Code"
-  echo "  rtk      → shell-output hook in both Claude Code and Codex"
-  echo "  ponytail → plugin in both Claude Code and Codex"
+  echo "  caveman    → both agents' base URL, proxy on :8787, chains to headroom"
+  echo "  headroom   → downstream compression hop on :$HEADROOM_PORT, on-demand MCP in Claude Code"
+  echo "  rtk        → shell-output hook in both Claude Code and Codex"
+  echo "  ponytail   → plugin in both Claude Code and Codex"
+  echo "  evolver    → session hooks in both Claude Code and Codex"
+  echo "  claude-mem → cross-session memory plugin in both, worker daemon on its own port"
   echo "  Just run 'claude' or 'codex' as usual — nothing else to launch."
 }
 
