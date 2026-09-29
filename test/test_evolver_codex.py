@@ -42,3 +42,35 @@ enabled = true
     assert (root / "config.toml.ats-backup").read_text() == original
     subprocess.run(["python3", str(script), str(root)], check=True)
     assert len(json.loads((root / "hooks.json").read_text())["hooks"]["SessionStart"]) == 1
+
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory)
+    home = root / "home"
+    home.mkdir()
+    project = root / "project"
+    config_dir = project / ".codex"
+    config_dir.mkdir(parents=True)
+    project_config = config_dir / "config.toml"
+    project_config.write_text("""[[hooks.SessionStart]]
+matcher = "startup|resume"
+[[hooks.SessionStart.hooks]]
+command = "evolver inject session-start --hook-stdin"
+statusMessage = "evolver-managed-hook"
+[[hooks.SessionStart.hooks]]
+command = "keep-session-hook"
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+command = "evolver inject prompt-recall --hook-stdin"
+statusMessage = "evolver-managed-hook"
+
+[mcp_servers.evolver]
+command = "keep-mcp"
+""")
+    subprocess.run(["python3", str(script), str(home), str(project / "nested")], check=True)
+    cleaned = project_config.read_text()
+    assert "evolver-managed-hook" not in cleaned
+    assert 'command = "keep-session-hook"' in cleaned
+    assert 'command = "keep-mcp"' in cleaned
+    assert "[[hooks.UserPromptSubmit]]" not in cleaned
+    assert (config_dir / "config.toml.ats-backup").exists()

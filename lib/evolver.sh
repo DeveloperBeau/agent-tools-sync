@@ -50,8 +50,8 @@ evolver_ensure_codex() {
       return
     fi
   fi
-  if run python3 "$SCRIPT_DIR/lib/evolver_codex_hooks.py" "$HOME/.codex"; then
-    ok "Codex hooks registered in hooks.json"
+  if run python3 "$SCRIPT_DIR/lib/evolver_codex_hooks.py" "$HOME/.codex" "$PWD" "$SCRIPT_DIR"; then
+    ok "Codex hooks registered; stale project copies removed"
   else
     warn "Codex hook registration failed"
   fi

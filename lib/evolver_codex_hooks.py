@@ -44,13 +44,37 @@ def remove_managed_toml_hooks(content):
                 break
             end += 1
         block = lines[index:end]
-        if 'statusMessage = "evolver-managed-hook"' not in "".join(block):
+        hook_starts = [
+            offset for offset, line in enumerate(block)
+            if line.startswith(f"[[hooks.{event}.hooks]]")
+        ]
+        kept = []
+        for start, stop in zip(hook_starts, hook_starts[1:] + [len(block)]):
+            hook = block[start:stop]
+            if 'statusMessage = "evolver-managed-hook"' not in "".join(hook):
+                kept.extend(hook)
+        if kept:
+            result.extend(block[:hook_starts[0]] if hook_starts else block)
+            result.extend(kept)
+        elif not hook_starts:
             result.extend(block)
         index = end
     return "".join(result)
 
 
-def main(directory):
+def clean_config(config_path):
+    if not config_path.exists():
+        return
+    original = config_path.read_text()
+    cleaned = remove_managed_toml_hooks(original)
+    if cleaned != original:
+        backup = config_path.with_name("config.toml.ats-backup")
+        if not backup.exists():
+            shutil.copy2(config_path, backup)
+        write_atomic(config_path, cleaned)
+
+
+def main(directory, project_roots=()):
     hooks_path = directory / "hooks.json"
     config_path = directory / "config.toml"
     data = json.loads(hooks_path.read_text()) if hooks_path.exists() else {"hooks": {}}
@@ -79,15 +103,16 @@ def main(directory):
     if not hooks_path.exists() or hooks_path.read_text() != encoded:
         write_atomic(hooks_path, encoded)
 
-    if config_path.exists():
-        original = config_path.read_text()
-        cleaned = remove_managed_toml_hooks(original)
-        if cleaned != original:
-            backup = config_path.with_name("config.toml.ats-backup")
-            if not backup.exists():
-                shutil.copy2(config_path, backup)
-            write_atomic(config_path, cleaned)
+    clean_config(config_path)
+    seen = {config_path.resolve()}
+    for root in project_roots:
+        path = Path(root).resolve()
+        for parent in (path, *path.parents):
+            candidate = parent / ".codex/config.toml"
+            if candidate not in seen:
+                clean_config(candidate)
+                seen.add(candidate)
 
 
 if __name__ == "__main__":
-    main(Path(sys.argv[1]))
+    main(Path(sys.argv[1]), sys.argv[2:])
