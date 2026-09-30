@@ -15,7 +15,7 @@
 # thin, side-effecting orchestration layer built on top.
 
 HEADROOM_MANIFEST="${HEADROOM_MANIFEST:-$HOME/.headroom/deploy/default/manifest.json}"
-HEADROOM_FORK_SOURCE='headroom-ai[all] @ git+https://github.com/DeveloperBeau/headroom.git@9b38d5ec8ea8426cb0ae4e12196b036887af50ef'
+HEADROOM_FORK_SOURCE='headroom-ai[all] @ git+https://github.com/DeveloperBeau/headroom.git@0e44f64344c40ef5c22c342312a7d31d2daa7233'
 
 # headroom_profile_exists STATUS_TEXT — 0 if `install status` returned a real
 # profile block, 1 if it returned the "no such profile" error.
@@ -166,9 +166,8 @@ headroom_fix_rc_file() {
 
 # headroom_fix_codex_config CONFIG_PATH — strips the retired "Headroom init
 # provider" block (root openai_base_url + model_providers.headroom) from
-# Codex's config.toml. Inert now that caveman owns Codex routing —
-# model_provider = "caveman" always wins — but stale unused config is still
-# worth cleaning up.
+# Codex's config.toml. caveman_patch_codex_route restores the provider name
+# for saved chats through the current proxy chain, outside these markers.
 headroom_fix_codex_config() {
   local cfg="$1"
   [ -f "$cfg" ] || return 0

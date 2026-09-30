@@ -4,7 +4,9 @@ import json
 import plistlib
 import tempfile
 import unittest
+from http.client import IncompleteRead
 from unittest.mock import patch
+from types import SimpleNamespace
 
 
 MODULE = pathlib.Path(__file__).resolve().parents[1] / "lib" / "proxy_watchdog.py"
@@ -22,6 +24,91 @@ def route(state, reason, age=1):
 
 
 class RecoveryDecisionTests(unittest.TestCase):
+    def test_process_sample_includes_cpu_and_state_without_command_line(self):
+        results = [SimpleNamespace(stdout="123\n"),
+                   SimpleNamespace(stdout="2048 8192 01:30 12.5 S\n")]
+        with patch.object(watchdog.subprocess, "run", side_effect=results) as run:
+            sample = watchdog._listener_memory(8788)
+        self.assertEqual(sample["rss_vsz_etime"], "2048 8192 01:30")
+        self.assertEqual(sample["cpu_percent"], 12.5)
+        self.assertEqual(sample["process_state"], "S")
+        self.assertNotIn("command", run.call_args.args[0][-1])
+
+    def test_network_snapshot_is_bounded_and_command_failures_are_nonfatal(self):
+        result = SimpleNamespace(returncode=0, stdout="x" * 20000, stderr="secret sentinel")
+        with patch.object(watchdog.subprocess, "run", return_value=result):
+            snapshot = watchdog._network_snapshot({"headroom_8788": {"pid": 123}})
+        self.assertLessEqual(len(snapshot["tcp_counters"]["output"]), 8000)
+        self.assertTrue(snapshot["tcp_counters"]["truncated"])
+        self.assertIn("headroom_8788", snapshot["sockets"])
+        self.assertNotIn("secret sentinel", json.dumps(snapshot))
+        with patch.object(watchdog.subprocess, "run", side_effect=OSError("secret sentinel")):
+            snapshot = watchdog._network_snapshot({})
+        self.assertEqual(snapshot["tcp_counters"]["probe_error"], "OSError")
+        self.assertNotIn("secret sentinel", json.dumps(snapshot))
+
+    def test_incident_captures_streams_before_slower_probes_and_keeps_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            calls = []
+            state = {
+                "last_stream_diagnostics": {"time": "before", "data": {"active": []}},
+                "diagnostic_samples": [{"time": "earlier", "active": []}],
+            }
+            def snapshot(url):
+                calls.append(url)
+                return {"active": [{"request_id": "hr_test", "waiting": "upstream_read"}]}
+            with patch.object(watchdog, "INCIDENTS", pathlib.Path(directory)), \
+                 patch.object(watchdog, "_snapshot", side_effect=snapshot), \
+                 patch.object(watchdog, "_listener_memory", return_value=None), \
+                 patch.object(watchdog, "_safe_log_tail", return_value=[]), \
+                 patch.object(watchdog, "_safe_caveman_tail", return_value=[]):
+                _, incident = watchdog._capture_incident("codex", {}, state)
+            self.assertEqual(calls[0], "http://127.0.0.1:8788/debug/streams")
+            self.assertEqual(incident["stream_diagnostics"]["active"][0]["request_id"], "hr_test")
+            self.assertEqual(incident["last_stream_diagnostics"], state["last_stream_diagnostics"])
+            self.assertEqual(incident["diagnostic_samples"], state["diagnostic_samples"])
+
+    def test_diagnostics_keep_last_good_snapshot_when_proxy_stops_responding(self):
+        state = {}
+        snapshot = {"active": [{"request_id": "hr_test"}], "connections": [], "recent": []}
+        with patch.object(watchdog, "_get_json", return_value=snapshot):
+            watchdog._sample_diagnostics(state, 100)
+        previous = state["last_stream_diagnostics"]
+        with patch.object(watchdog, "_get_json", side_effect=TimeoutError("private sentinel")):
+            watchdog._sample_diagnostics(state, 110)
+        self.assertEqual(state["last_stream_diagnostics"], previous)
+        self.assertEqual(state["diagnostics_probe_error"], "TimeoutError")
+        self.assertNotIn("private sentinel", json.dumps(state))
+
+    def test_truncated_diagnostic_response_does_not_block_recovery(self):
+        state = {"last_stream_diagnostics": {"time": "before", "data": {"active": []}}}
+        previous = dict(state)
+        with patch.object(watchdog, "_get_json", side_effect=IncompleteRead(b"private sentinel")):
+            watchdog._sample_diagnostics(state, 100)
+            self.assertIn("probe_error", watchdog._snapshot(watchdog.STREAMS_URL))
+        self.assertEqual(state["last_stream_diagnostics"], previous["last_stream_diagnostics"])
+        self.assertEqual(state["diagnostics_probe_error"], "IncompleteRead")
+
+    def test_malformed_diagnostic_connections_do_not_replace_last_good_snapshot(self):
+        state = {"last_stream_diagnostics": {"time": "before", "data": {"active": []}}}
+        previous = dict(state)
+        with patch.object(watchdog, "_get_json", return_value={"active": [], "connections": {"id": 1}}):
+            watchdog._sample_diagnostics(state, 100)
+        self.assertEqual(state["last_stream_diagnostics"], previous["last_stream_diagnostics"])
+        self.assertEqual(state["diagnostics_probe_error"], "ValueError")
+
+    def test_diagnostic_history_is_bounded_and_omits_completed_requests(self):
+        state = {}
+        snapshot = {"active": [{"request_id": str(i)} for i in range(200)],
+                    "connections": [{"id": i} for i in range(200)],
+                    "recent": [{"request_id": "already-finished"}]}
+        with patch.object(watchdog, "_get_json", return_value=snapshot):
+            for now in range(20):
+                watchdog._sample_diagnostics(state, now)
+        self.assertLessEqual(len(state["diagnostic_samples"]), 12)
+        self.assertLessEqual(len(state["diagnostic_samples"][-1]["active"]), 16)
+        self.assertNotIn("already-finished", json.dumps(state["diagnostic_samples"]))
+
     def test_recover_codex_from_repeated_broken_streams(self):
         routes = {
             "codex": route("unhealthy", "missing_terminal_event"),

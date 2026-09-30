@@ -109,8 +109,58 @@ assert_contains "patch_codex_route: base_url repointed at compat/headroom" "$pat
 assert_contains "patch_codex_route: unrelated root base_url survives (dead but not this function's job)" \
   "$patched_codex" 'openai_base_url = "http://127.0.0.1:8788/v1"'
 assert_contains "patch_codex_route: wire_api line survives" "$patched_codex" 'wire_api = "responses"'
+HEADROOM_COMPAT_FIELDS=$'[model_providers.headroom]\nname = "Headroom (compatibility)"\nbase_url = "http://127.0.0.1:8787/compat/headroom"\nwire_api = "responses"\nrequires_openai_auth = true'
+assert_contains "patch_codex_route: saved headroom chats retain their provider through the proxy chain" \
+  "$patched_codex" "$HEADROOM_COMPAT_FIELDS"
+assert_contains "patch_codex_route: default provider stays caveman" "$patched_codex" 'model_provider = "caveman"'
 CAVEMAN_CODEX_CONFIG="$tmp_codex" caveman_patch_codex_route >/dev/null
 assert_eq "patch_codex_route: running twice is a no-op the second time" "$patched_codex" "$(cat "$tmp_codex")"
+
+# ATS already removed the legacy provider on affected machines. Repair must
+# run even when the current Caveman route no longer needs patching.
+printf '%s' "${CODEX_FIXTURE/8787\/chatgpt/8787/compat/headroom}" > "$tmp_codex"
+CAVEMAN_CODEX_CONFIG="$tmp_codex" caveman_patch_codex_route >/dev/null
+assert_contains "patch_codex_route: repairs an already-patched config missing headroom" \
+  "$(cat "$tmp_codex")" "$HEADROOM_COMPAT_FIELDS"
+
+# Codex rewrites TOML without retaining Caveman's ownership comments.
+MARKERLESS_CODEX=$'model_provider = "caveman"\n\n[model_providers.caveman]\nname = "Caveman"\nbase_url = "http://127.0.0.1:8787/compat/headroom"\nwire_api = "responses"\nrequires_openai_auth = true\n\n[model_providers.other]\nbase_url = "http://127.0.0.1:8787/chatgpt"\n'
+printf '%s' "$MARKERLESS_CODEX" > "$tmp_codex"
+CAVEMAN_CODEX_CONFIG="$tmp_codex" caveman_patch_codex_route >/dev/null
+assert_contains "patch_codex_route: repairs markerless config rewritten by Codex" "$(cat "$tmp_codex")" "$HEADROOM_COMPAT_FIELDS"
+printf '%s' "${MARKERLESS_CODEX/8787\/compat\/headroom/8787/chatgpt}" > "$tmp_codex"
+CAVEMAN_CODEX_CONFIG="$tmp_codex" caveman_patch_codex_route >/dev/null
+assert_contains "patch_codex_route: markerless native Caveman route reaches the chain" \
+  "$(cat "$tmp_codex")" $'[model_providers.caveman]\nname = "Caveman"\nbase_url = "http://127.0.0.1:8787/compat/headroom"'
+assert_contains "patch_codex_route: sibling provider keeps its native URL" \
+  "$(cat "$tmp_codex")" $'[model_providers.other]\nbase_url = "http://127.0.0.1:8787/chatgpt"'
+printf '%s' "${MARKERLESS_CODEX/8787\/compat\/headroom/9999/custom}" > "$tmp_codex"
+custom_codex="$(cat "$tmp_codex")"
+CAVEMAN_CODEX_CONFIG="$tmp_codex" caveman_patch_codex_route >/dev/null
+assert_eq "patch_codex_route: custom Caveman upstream stays untouched" "$custom_codex" "$(cat "$tmp_codex")"
+
+# Match setup_headroom -> setup_caveman, including future ATS reruns.
+source "$HERE/../lib/headroom.sh"
+printf '%s\n%s\n' "$CODEX_FIXTURE" $'# --- Headroom init provider ---\n[model_providers.headroom]\nname = "Headroom init proxy"\nbase_url = "http://127.0.0.1:8788/v1"\n# --- end Headroom init provider ---\n\n[features]\nhooks = true' > "$tmp_codex"
+headroom_fix_codex_config "$tmp_codex" >/dev/null
+CAVEMAN_CODEX_CONFIG="$tmp_codex" caveman_patch_codex_route >/dev/null
+patched_codex="$(cat "$tmp_codex")"
+assert_contains "patch_codex_route: legacy cleanup retains saved-chat compatibility" "$patched_codex" "$HEADROOM_COMPAT_FIELDS"
+assert_contains "patch_codex_route: unrelated table survives migration" "$patched_codex" $'[features]\nhooks = true'
+headroom_fix_codex_config "$tmp_codex" >/dev/null
+CAVEMAN_CODEX_CONFIG="$tmp_codex" caveman_patch_codex_route >/dev/null
+assert_eq "patch_codex_route: compatibility survives repeated legacy cleanup" "$patched_codex" "$(cat "$tmp_codex")"
+
+EXISTING_HEADROOM=$'[model_providers.headroom]\nname = "User provider"\nbase_url = "https://example.test/v1"'
+printf '%s\n%s\n' "$CODEX_FIXTURE" "$EXISTING_HEADROOM" > "$tmp_codex"
+CAVEMAN_CODEX_CONFIG="$tmp_codex" caveman_patch_codex_route >/dev/null
+assert_contains "patch_codex_route: existing user provider survives" "$(cat "$tmp_codex")" "$EXISTING_HEADROOM"
+assert_eq "patch_codex_route: existing provider is not duplicated" 1 "$(grep -c '^\[model_providers.headroom\]$' "$tmp_codex")"
+
+printf '%s\n' $'model_provider = "openai"\n\n[features]\nhooks = true' > "$tmp_codex"
+unmanaged_codex="$(cat "$tmp_codex")"
+CAVEMAN_CODEX_CONFIG="$tmp_codex" caveman_patch_codex_route >/dev/null
+assert_eq "patch_codex_route: config without Caveman ownership stays untouched" "$unmanaged_codex" "$(cat "$tmp_codex")"
 rm -f "$tmp_codex"
 
 # --- patch_claude_route (real temp file, real node JSON patch) --------------

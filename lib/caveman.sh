@@ -191,27 +191,48 @@ caveman_patch_claude_route() {
   fi
 }
 
-# caveman_patch_codex_route — same idea for Codex's model_providers.caveman
-# table, scoped to caveman's own owned block so nothing else in config.toml
-# is touched.
+# caveman_patch_codex_route — patch Caveman's known local routes and retain
+# the headroom provider name used by saved Codex chats. Scope by table:
+# Codex rewrites TOML without retaining Caveman's ownership comments.
 caveman_patch_codex_route() {
   [ -f "$CAVEMAN_CODEX_CONFIG" ] || return 0
-  if ! grep -q 'base_url = "http://127.0.0.1:8787/chatgpt"' "$CAVEMAN_CODEX_CONFIG" 2>/dev/null; then
-    skip "Codex already routed through compat/headroom"
-    return
-  fi
   local tmp
-  tmp="$(mktemp)"
-  awk '
-    /^# >>> caveman:native-tables/ { inblock=1 }
-    /^# <<< caveman:native-tables/ { inblock=0 }
-    inblock && /^base_url = "http:\/\/127\.0\.0\.1:8787\/chatgpt"/ {
+  tmp="$(mktemp)" || return 1
+  if ! awk '
+    /^[[:space:]]*\[/ {
+      caveman=($0 ~ /^[[:space:]]*\[model_providers\.caveman\][[:space:]]*(#.*)?$/)
+    }
+    /^[[:space:]]*\[model_providers\.headroom\][[:space:]]*(#.*)?$/ { headroom=1 }
+    caveman && /^base_url = "http:\/\/127\.0\.0\.1:8787\/(chatgpt|compat\/headroom)"/ { managed=1 }
+    caveman && /^base_url = "http:\/\/127\.0\.0\.1:8787\/chatgpt"/ {
       print "base_url = \"http://127.0.0.1:8787/compat/headroom\""
       next
     }
     { print }
-  ' "$CAVEMAN_CODEX_CONFIG" > "$tmp" && mv "$tmp" "$CAVEMAN_CODEX_CONFIG"
-  ok "Codex now chains caveman -> headroom"
+    END {
+      if (managed && !headroom) {
+        print "\n# Compatibility for saved Codex chats using the headroom provider."
+        print "[model_providers.headroom]"
+        print "name = \"Headroom (compatibility)\""
+        print "base_url = \"http://127.0.0.1:8787/compat/headroom\""
+        print "wire_api = \"responses\""
+        print "requires_openai_auth = true"
+      }
+    }
+  ' "$CAVEMAN_CODEX_CONFIG" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if cmp -s "$tmp" "$CAVEMAN_CODEX_CONFIG"; then
+    rm -f "$tmp"
+    skip "Codex routing and saved-chat provider already configured"
+  elif mv "$tmp" "$CAVEMAN_CODEX_CONFIG"; then
+    ok "Codex now chains caveman -> headroom with saved-chat compatibility"
+  else
+    rm -f "$tmp"
+    warn "failed to patch $CAVEMAN_CODEX_CONFIG"
+    return 1
+  fi
 }
 
 setup_caveman() {
