@@ -64,6 +64,7 @@ class RecoveryDecisionTests(unittest.TestCase):
                  patch.object(watchdog, "_listener_memory", return_value={"pid": 123}), \
                  patch.object(watchdog, "_safe_log_tail", return_value=[]), \
                  patch.object(watchdog, "_safe_caveman_tail", return_value=[]), \
+                 patch.object(watchdog, "_managed_headroom_loaded", return_value=True), \
                  patch.object(watchdog, "_restart_headroom", side_effect=restart), \
                  patch.object(watchdog, "_ready_after_restart", return_value=True), \
                  patch.object(watchdog, "_notify") as notify, \
@@ -77,6 +78,14 @@ class RecoveryDecisionTests(unittest.TestCase):
             self.assertEqual(len(incident["memory_samples"]), 1)
             self.assertEqual(incident["restart"]["exit_code"], 1)
             self.assertIn("recovery failed", notify.call_args.args[0])
+
+    def test_deliberately_unloaded_headroom_is_not_restarted(self):
+        with patch.object(watchdog, "_managed_headroom_loaded", return_value=False), \
+             patch.object(watchdog, "_restart_headroom") as restart, \
+             patch.object(watchdog, "_save_json") as save:
+            watchdog.recover("headroom_health_endpoint", {}, {}, 10_000)
+        restart.assert_not_called()
+        save.assert_not_called()
 
     def test_three_unresponsive_health_probes_trigger_recovery(self):
         with tempfile.TemporaryDirectory() as directory:

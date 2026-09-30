@@ -162,7 +162,24 @@ def _snapshot(url: str):
         return {"probe_error": f"{type(error).__name__}: {error}"}
 
 
+def _managed_headroom_loaded() -> bool:
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}/com.headroom.default"],
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def recover(route: str, routes: dict, state: dict, now: float) -> None:
+    # A deliberately unloaded service must stay stopped. KeepAlive handles
+    # crashes; a loaded but unresponsive service still needs recovery.
+    if not _managed_headroom_loaded():
+        return
     incident = {
         "time": datetime.now(timezone.utc).isoformat(),
         "route": route,

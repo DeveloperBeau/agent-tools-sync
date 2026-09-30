@@ -12,6 +12,8 @@ broken streams or HTTP 5xx responses trigger one Headroom restart. Three failed
 health endpoint probes also trigger recovery. Restarts have a persistent thirty
 minute cooldown; authentication errors and rate limits do not trigger restarts.
 Slow active requests alone do not trigger restarts.
+Recovery requires the managed Headroom LaunchAgent to remain loaded. A deliberate
+Headroom stop or `ats kill` stays stopped; the watchdog does not start it again.
 
 Before restart, it saves route outcomes, process memory and uptime, six hours of
 minute memory samples, Headroom runtime health and task state, payload-free stream
