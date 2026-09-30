@@ -25,7 +25,7 @@ unset _src _dir
 
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
-if [ "${1:-}" != kill ]; then
+if [ "${1:-}" != kill ] && [ "${1:-}" != start ]; then
   if ats_check_update "$SCRIPT_DIR"; then
     :
   elif [ "$?" -eq 2 ]; then
@@ -72,8 +72,7 @@ cmd_kill() {
 # rtk/caveman-agent/ponytail sync. The counterpart to cmd_kill.
 cmd_start() {
   section "start"
-  caveman_start_proxy
-  headroom_ensure_proxy "$HEADROOM_PORT"
+  bash "$SCRIPT_DIR/proxy-chain.sh" start || return 1
   claude_mem_start_worker
 }
 
