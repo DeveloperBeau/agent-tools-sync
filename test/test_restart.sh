@@ -7,11 +7,11 @@ source "$HERE/../lib/headroom.sh"
 source "$HERE/../lib/caveman.sh"
 
 headroom_restart_check() (
-  version=1 target_version="$1" expected="$2" order=""
+  pinned="$1" expected="$2" order="" HEADROOM_PORT=8788
   have() { return 0; }
-  headroom() { [ "$1" = --version ] && printf '%s\n' "$version"; }
-  install_headroom() { :; }
-  with_timeout() { version="$target_version"; }
+  headroom_has_route_health() { [ "$pinned" = true ]; }
+  install_headroom() { pinned=true; }
+  with_timeout() { return 0; }
   headroom_stop_proxy() { order="${order}S"; }
   headroom_fix_rc_file() { :; }
   headroom_fix_codex_config() { :; }
@@ -42,8 +42,8 @@ caveman_restart_check() (
   [ "$order" = "$expected" ]
 )
 
-check "Headroom update stops old proxy before ensuring new one" headroom_restart_check 2 SE
-check "Headroom without update keeps running proxy" headroom_restart_check 1 E
+check "Headroom pin change stops old proxy before ensuring new one" headroom_restart_check false SE
+check "Headroom matching pin keeps running proxy" headroom_restart_check true E
 check "Caveman update restarts running proxy" caveman_restart_check 2 SB
 check "Caveman without update keeps running proxy" caveman_restart_check 1 ""
 report

@@ -24,7 +24,7 @@ updated() { ats_check_update "$tmp/work"; [ "$?" -eq 2 ]; }
 check "fast-forward update detected" updated
 check "new content present" test "$(cat "$tmp/work/version")" = new
 check "current checkout reports ready" ats_check_update "$tmp/work"
-version_shown() { [[ "$(ats_check_update "$tmp/work")" == *"ats v1.4.0"* ]]; }
+version_shown() { [[ "$(ats_check_update "$tmp/work")" == *"ats v$ATS_VERSION"* ]]; }
 check "current version shown during update check" version_shown
 
 printf 'local\n' >"$tmp/work/local"
