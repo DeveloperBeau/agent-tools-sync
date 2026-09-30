@@ -11,6 +11,7 @@ Safe to re-run any time: every step checks current state first and only acts whe
 - **rtk** — shell-output compression hook in both Claude Code and Codex.
 - **ponytail** — lazy-coding plugin in both Claude Code and Codex.
 - **Ship** — optional private plugin in both agents. ATS runs `ship-update` when installed, or attempts installation through authenticated GitHub CLI. Missing access leaves rest of sync working.
+- **SkillOpt** — [Microsoft's skill optimizer](https://github.com/microsoft/SkillOpt), with the SkillOpt-Sleep plugin for Claude Code and skill for Codex CLI/Desktop. Runs on demand and stages learned changes for review.
 
 Both tools are universal (each can wrap Claude Code, Codex, and a dozen other agents on its own) and are designed to stack rather than split one-per-agent — caveman's own README benchmarks headroom head-to-head as a direct alternative, and headroom's README documents running "Caveman, or any other MCP server" upstream of it. So the request path is `agent → caveman (:8787) → headroom (:8788) → real provider`, via a `compat` mount in `~/.caveman/caveman.yaml` (caveman has no override for its native wrap routes' upstream, only for named `compat` mounts) with `CAVE_SSRF_ALLOWLIST` opened for the loopback hop. `ats` patches `ANTHROPIC_BASE_URL` in `~/.claude/settings.json` and `model_providers.caveman.base_url` in `~/.codex/config.toml` to point at that mount instead of caveman's native `/w/claude` / `/chatgpt` routes. One side effect: `caveman status` reports both integrations as "degraded" afterward (it fingerprints the files it writes, and the patch changes them) — `ats` recognizes that as expected and won't retry or warn about it.
 
@@ -58,6 +59,31 @@ During full sync, ATS checks tool updates before setup. Headroom stays pinned to
 Optional standalone watchdog records separate Claude and ChatGPT Codex route health, captures incident evidence, and performs bounded Headroom recovery. It respects deliberate proxy stops and can capture reports manually. See [proxy recovery instructions](PROXY_RECOVERY.md) for installation, upstream fork maintenance, and rollback. ATS does not install or activate the watchdog automatically.
 
 `ats kill` is a hard stop — nothing auto-restarts headroom's proxy afterward (unlike caveman, which self-starts on the next agent session). Since caveman chains every request through headroom, both agents get connection-refused on the last hop until you run `ats start` or `ats`.
+
+## SkillOpt
+
+ATS keeps a source checkout at `~/.local/share/skillopt` and installs its CLI with
+`uv tool`. Future syncs fast-forward the checkout and refresh the agent integrations.
+Set `SKILLOPT_SLEEP_REPO` to use another checkout location. Local checkout changes
+are preserved. The Codex skill includes the checkout path so desktop sessions can
+find it without inheriting terminal environment variables.
+
+In Claude Code, use `/skillopt-sleep status`. In Codex, ask: “Use the skillopt-sleep
+skill to run status for this project.” Start a new session after installation to
+load the new integration. The CLI also works directly:
+
+```sh
+skillopt-sleep status --project "$PWD"
+```
+
+Optimization is opt-in. The default `mock` backend makes no model calls; real
+`claude` and `codex` backends use the corresponding agent account and send
+transcript-derived content to its provider. Review proposals before adoption.
+Scheduling and automatic adoption remain explicit choices in SkillOpt.
+
+For Codex learning runs, select `--source codex` and a Codex-visible
+`--target-skill-path .agents/skills/<name>/SKILL.md`. Upstream's shared memory
+target is `CLAUDE.md`; it does not write `AGENTS.md`.
 
 ## Testing
 
