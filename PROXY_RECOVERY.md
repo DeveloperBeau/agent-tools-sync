@@ -47,7 +47,7 @@ Install the Headroom revision pinned by `HEADROOM_FORK_SOURCE` in `lib/headroom.
 then restart Headroom directly:
 
 ```sh
-uv tool install --force --python 3.13 'headroom-ai[all] @ git+https://github.com/DeveloperBeau/headroom.git@b928ca8aaae4fdfc3fc294d3ab25a6ed8fbad5ce'
+uv tool install --force --python 3.13 'headroom-ai[all] @ git+https://github.com/DeveloperBeau/headroom.git@9b38d5ec8ea8426cb0ae4e12196b036887af50ef'
 headroom install restart --profile default
 python3 /absolute/path/to/agent-tools-sync/lib/proxy_watchdog.py install
 ```
