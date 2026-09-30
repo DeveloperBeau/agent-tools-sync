@@ -1,5 +1,11 @@
 # Proxy incident capture and recovery
 
+Codex image generation uses bare `/images/generations` and `/images/edits` paths.
+The pinned Headroom fork registers these alongside `/v1/images/...`, preserving
+subscription authentication and forwarding to the Codex image backend. Without
+these aliases, the generic fallback sends requests to the wrong ChatGPT path and
+can return a redirect that subsequently fails at Caveman with `cave_route_not_found`.
+
 The diagnostic Headroom fork observes real Claude `/v1/messages` traffic and
 ChatGPT Codex Responses traffic separately. No inference probes are sent.
 Successful HTTP connection alone is insufficient: SSE must reach its terminal
@@ -12,6 +18,13 @@ broken streams or HTTP 5xx responses trigger one Headroom restart. Three failed
 health endpoint probes also trigger recovery. Restarts have a persistent thirty
 minute cooldown; authentication errors and rate limits do not trigger restarts.
 Slow active requests alone do not trigger restarts.
+Cooldown delays another restart, not failure detection. A qualifying failure
+during cooldown captures an incident and sends a notification once per affected
+route per cooldown window. This also applies after three failed health probes.
+Persistent `cooldown_alerts` state prevents repeated ten-second notifications,
+including after the watchdog itself restarts. State and `event=recovery_suppressed`
+logs identify the failure reason and remaining cooldown; the restart timer stays
+unchanged. Continued failures can trigger recovery when cooldown expires.
 Recovery requires the managed Headroom LaunchAgent to remain loaded. A deliberate
 Headroom stop or `ats kill` stays stopped; the watchdog does not start it again.
 
@@ -59,7 +72,7 @@ Install the Headroom revision pinned by `HEADROOM_FORK_SOURCE` in `lib/headroom.
 then restart Headroom directly:
 
 ```sh
-uv tool install --force --python 3.13 'headroom-ai[all] @ git+https://github.com/DeveloperBeau/headroom.git@0e44f64344c40ef5c22c342312a7d31d2daa7233'
+uv tool install --force --python 3.13 'headroom-ai[all] @ git+https://github.com/DeveloperBeau/headroom.git@313236de0c0c4f7ea93207d88a34bc761d2519d6'
 headroom install restart --profile default
 python3 /absolute/path/to/agent-tools-sync/lib/proxy_watchdog.py install
 ```
@@ -114,22 +127,37 @@ completed request on one route does not establish health of the other route.
 
 ## Automatic Caveman size bypass
 
-The patched Caveman proxy automatically skips optimization for requests above
-32 MiB and forwards them through the configured Headroom route. The next smaller
-request uses compression normally. No command or provider switch is needed.
-Authentication, SSRF checks, header mapping, native session-marker cleanup,
-streaming, and existing retry rules remain in place. An upstream error on an
-unmodified request is returned without replaying that request.
+On the configured `/compat/headroom/` route, Caveman streams requests above
+32 MiB unchanged, without inspecting or transforming the body. This includes
+media bytes and native session markers. A declared oversized body streams
+immediately; an unknown-length upload retains at most the transform budget plus
+one byte, then forwards that prefix and the remaining upload together. Caveman
+adds `x-headroom-bypass: true` after header sanitation so Headroom also skips body
+processing. The next smaller request uses compression normally. No command or
+provider switch is needed.
 
-`CAVE_MAX_TRANSFORM_BYTES` controls the compression ceiling (default 32 MiB).
-`CAVE_MAX_REQUEST_BYTES` remains the hard upload ceiling (default 100 MiB);
-explicit positive overrides remain authoritative. Headroom also limits wire and
-decompressed bodies to 100 MiB. A hard-limit rejection still returns 413.
-Buffering and metadata parsing can use more memory than the input byte limit.
+`CAVE_MAX_TRANSFORM_BYTES` controls the processing budget (default 32 MiB).
+The Headroom route has no default 100 MiB upload rejection. An explicit positive
+`CAVE_MAX_REQUEST_BYTES` still sets a hard limit: known oversized uploads receive
+413 before forwarding; unknown-length uploads stop when their reader reaches
+the limit. Streamed requests are never replayed, including after upload failure
+or an upstream rejection. Authentication, configured routing, header mapping,
+SSRF checks, cancellation, and upload deadlines remain enforced. Other Caveman
+provider routes retain their existing buffered behavior and default 100 MiB cap.
+
+Headroom independently streams supported Responses and Messages requests above
+its 100 MiB processing budget unchanged, including requests that arrive without
+Caveman. Requests that need body-dependent policy enforcement retain their
+policy limits; raw forwarding does not bypass those checks. The processing
+budgets bound retained input, not process RSS: copies, concurrent requests, and
+other proxy work can use additional memory.
 
 Responses disclose size bypass with `x-cave-bypass: request_size`. Private
-`~/.caveman/proxy.log` records `event=request_bypass`, request ID, size, and both
-limits without payloads or credentials. Hard rejections record
+`~/.caveman/proxy.log` records `event=request_bypass`, request ID, declared size,
+and limits without payloads or credentials. Streamed requests also record
+`event=request_bypass_complete` with bytes consumed by the upstream transport
+and whether the complete-body hash is known. Partial uploads never claim a
+complete hash or invented model/token savings. Hard rejections record
 `event=request_rejected` and bytes seen, which may be less than the full upload.
 
 ATS builds the pinned upstream revision plus `patches/caveman-request-size.patch`

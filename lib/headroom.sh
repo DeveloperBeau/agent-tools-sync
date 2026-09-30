@@ -15,7 +15,7 @@
 # thin, side-effecting orchestration layer built on top.
 
 HEADROOM_MANIFEST="${HEADROOM_MANIFEST:-$HOME/.headroom/deploy/default/manifest.json}"
-HEADROOM_FORK_SOURCE='headroom-ai[all] @ git+https://github.com/DeveloperBeau/headroom.git@0e44f64344c40ef5c22c342312a7d31d2daa7233'
+HEADROOM_FORK_SOURCE='headroom-ai[all] @ git+https://github.com/DeveloperBeau/headroom.git@313236de0c0c4f7ea93207d88a34bc761d2519d6'
 
 # headroom_profile_exists STATUS_TEXT — 0 if `install status` returned a real
 # profile block, 1 if it returned the "no such profile" error.

@@ -114,28 +114,25 @@ class RecoveryDecisionTests(unittest.TestCase):
             "codex": route("unhealthy", "missing_terminal_event"),
             "claude": route("healthy", "completed"),
         }
-        self.assertEqual(watchdog.recovery_candidate(routes, 0, 10_000), "codex")
+        self.assertEqual(watchdog.recovery_candidates(routes), ["codex"])
 
-    def test_auth_limits_and_cooldown_do_not_restart(self):
+    def test_auth_and_rate_limits_are_not_recoverable_failures(self):
         for reason in ("http_401", "http_429"):
             routes = {"claude": route("unhealthy", reason)}
-            self.assertIsNone(watchdog.recovery_candidate(routes, 0, 10_000))
-
-        routes = {"codex": route("unhealthy", "sse_error")}
-        self.assertIsNone(watchdog.recovery_candidate(routes, 9_500, 10_000))
+            self.assertEqual(watchdog.recovery_candidates(routes), [])
 
     def test_repeated_server_errors_restart_either_route(self):
         for provider in ("codex", "claude"):
             for reason in ("http_500", "http_502", "http_503", "http_504"):
                 routes = {provider: route("unhealthy", reason)}
-                self.assertEqual(watchdog.recovery_candidate(routes, 0, 10_000), provider)
+                self.assertEqual(watchdog.recovery_candidates(routes), [provider])
 
     def test_healthy_and_unknown_routes_do_not_restart(self):
         routes = {
             "codex": route("healthy", "completed"),
             "claude": route("unknown", None, age=None),
         }
-        self.assertIsNone(watchdog.recovery_candidate(routes, 0, 10_000))
+        self.assertEqual(watchdog.recovery_candidates(routes), [])
 
     def test_failed_restart_preserves_evidence_and_reports_failure(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -151,6 +148,7 @@ class RecoveryDecisionTests(unittest.TestCase):
             with patch.multiple(watchdog, STATE_PATH=root / "state.json", INCIDENTS=root / "incidents"), \
                  patch.object(watchdog, "_get_json", return_value=routes), \
                  patch.object(watchdog, "_listener_memory", return_value={"pid": 123}), \
+                 patch.object(watchdog, "_network_snapshot", return_value={}), \
                  patch.object(watchdog, "_safe_log_tail", return_value=[]), \
                  patch.object(watchdog, "_safe_caveman_tail", return_value=[]), \
                  patch.object(watchdog, "_managed_headroom_loaded", return_value=True), \
@@ -169,12 +167,17 @@ class RecoveryDecisionTests(unittest.TestCase):
             self.assertIn("recovery failed", notify.call_args.args[0])
 
     def test_deliberately_unloaded_headroom_is_not_restarted(self):
-        with patch.object(watchdog, "_managed_headroom_loaded", return_value=False), \
-             patch.object(watchdog, "_restart_headroom") as restart, \
-             patch.object(watchdog, "_save_json") as save:
-            watchdog.recover("headroom_health_endpoint", {}, {}, 10_000)
-        restart.assert_not_called()
-        save.assert_not_called()
+        for last_attempt in (0, 9500):
+            with patch.object(watchdog, "_managed_headroom_loaded", return_value=False), \
+                 patch.object(watchdog, "_restart_headroom") as restart, \
+                 patch.object(watchdog, "_capture_incident") as capture, \
+                 patch.object(watchdog, "_notify") as notify, \
+                 patch.object(watchdog, "_save_json") as save:
+                watchdog.recover("headroom_health_endpoint", {}, {"last_attempt": last_attempt}, 10_000)
+            restart.assert_not_called()
+            capture.assert_not_called()
+            notify.assert_not_called()
+            save.assert_not_called()
 
     def test_manual_capture_does_not_restart_or_change_watchdog_state(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -219,6 +222,85 @@ class RecoveryDecisionTests(unittest.TestCase):
                  patch.object(watchdog, "_listener_memory", return_value=None), \
                  patch.object(watchdog, "recover") as recover, \
                  patch.object(watchdog.os, "umask"), \
+                 patch.object(watchdog.time, "sleep", side_effect=[None, None, KeyboardInterrupt]):
+                with self.assertRaises(KeyboardInterrupt):
+                    watchdog.watch()
+            recover.assert_called_once()
+            self.assertEqual(recover.call_args.args[0], "headroom_health_endpoint")
+
+    def test_cooldown_captures_and_notifies_each_failed_route_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            state_path = root / "state.json"
+            state_path.write_text(json.dumps({"last_attempt": 9500}))
+            routes = {"codex": route("unhealthy", "sse_error"),
+                      "claude": route("unhealthy", "http_503")}
+            with patch.multiple(watchdog, STATE_PATH=state_path, INCIDENTS=root / "incidents"), \
+                 patch.object(watchdog, "_get_json", return_value=routes), \
+                 patch.object(watchdog, "_snapshot", return_value={}), \
+                 patch.object(watchdog, "_listener_memory", return_value=None), \
+                 patch.object(watchdog, "_network_snapshot", return_value={}), \
+                 patch.object(watchdog, "_safe_log_tail", return_value=[]), \
+                 patch.object(watchdog, "_safe_caveman_tail", return_value=[]), \
+                 patch.object(watchdog, "_managed_headroom_loaded", return_value=True), \
+                 patch.object(watchdog, "_restart_headroom") as restart, \
+                 patch.object(watchdog, "_notify") as notify, \
+                 patch.object(watchdog.time, "time", return_value=10_000), \
+                 patch.object(watchdog.time, "sleep", side_effect=[None, None, KeyboardInterrupt]):
+                with self.assertRaises(KeyboardInterrupt):
+                    watchdog.watch()
+            restart.assert_not_called()
+            self.assertEqual(notify.call_count, 2)
+            self.assertEqual(len(list((root / "incidents").glob("*.json"))), 2)
+            state = json.loads(state_path.read_text())
+            self.assertEqual(state["last_attempt"], 9500)
+            self.assertEqual(set(state["cooldown_alerts"]), {"codex", "claude"})
+            for name, reason in (("codex", "sse_error"), ("claude", "http_503")):
+                alert = state["cooldown_alerts"][name]
+                self.assertEqual(alert["failure_reason"], reason)
+                self.assertEqual(alert["cooldown_remaining_seconds"], 1300)
+                incident = json.loads(pathlib.Path(alert["incident"]).read_text())
+                self.assertEqual(incident["recovery_suppressed"]["reason"], "restart_cooldown")
+
+    def test_cooldown_alert_survives_reload_and_rearms_after_next_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            state_path = root / "state.json"
+            routes = {"codex": route("unhealthy", "sse_error")}
+            state = {"last_attempt": 9500}
+            with patch.multiple(watchdog, STATE_PATH=state_path, INCIDENTS=root / "incidents"), \
+                 patch.object(watchdog, "_snapshot", return_value={}), \
+                 patch.object(watchdog, "_listener_memory", return_value=None), \
+                 patch.object(watchdog, "_network_snapshot", return_value={}), \
+                 patch.object(watchdog, "_safe_log_tail", return_value=[]), \
+                 patch.object(watchdog, "_safe_caveman_tail", return_value=[]), \
+                 patch.object(watchdog, "_managed_headroom_loaded", return_value=True), \
+                 patch.object(watchdog, "_restart_headroom", return_value={"exit_code": 0}) as restart, \
+                 patch.object(watchdog, "_ready_after_restart", return_value=True), \
+                 patch.object(watchdog, "_notify") as notify:
+                watchdog.recover("codex", routes, state, 10_000)
+                state = json.loads(state_path.read_text())
+                watchdog.recover("codex", routes, state, 10_010)
+                restart.assert_not_called()
+                self.assertEqual(notify.call_count, 1)
+                self.assertEqual(state["cooldown_alerts"]["codex"]["cooldown_remaining_seconds"], 1290)
+                watchdog.recover("codex", routes, state, 11_300)
+                restart.assert_called_once()
+                self.assertEqual(state["last_attempt"], 11_300)
+                watchdog.recover("codex", routes, state, 11_310)
+                self.assertEqual(restart.call_count, 1)
+                self.assertEqual(notify.call_count, 3)
+                self.assertEqual(state["cooldown_alerts"]["codex"]["cooldown_remaining_seconds"], 1790)
+
+    def test_unresponsive_health_is_detected_even_during_cooldown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "state.json").write_text(json.dumps({"last_attempt": 9500}))
+            with patch.multiple(watchdog, STATE_PATH=root / "state.json", INCIDENTS=root / "incidents"), \
+                 patch.object(watchdog, "_get_json", side_effect=TimeoutError("probe timeout")), \
+                 patch.object(watchdog, "_listener_memory", return_value=None), \
+                 patch.object(watchdog, "recover") as recover, \
+                 patch.object(watchdog.time, "time", return_value=10_000), \
                  patch.object(watchdog.time, "sleep", side_effect=[None, None, KeyboardInterrupt]):
                 with self.assertRaises(KeyboardInterrupt):
                     watchdog.watch()

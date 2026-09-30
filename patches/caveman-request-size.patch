@@ -1,8 +1,8 @@
 diff --git a/docs/technical/proxy-reliability.md b/docs/technical/proxy-reliability.md
-index f0356f4..3d6c780 100644
+index f0356f4..5656d28 100644
 --- a/docs/technical/proxy-reliability.md
 +++ b/docs/technical/proxy-reliability.md
-@@ -87,9 +87,27 @@ client timeout remains active while reading the response body.
+@@ -87,9 +87,45 @@ client timeout remains active while reading the response body.
  There is no proxy session TTL. An idle HTTP keep-alive connection can still be
  closed and reopened normally; this is separate from listener or generation
  lifetime. TCP/TLS setup remains bounded, as do the wait for the first upstream
@@ -18,13 +18,31 @@ index f0356f4..3d6c780 100644
 +the configured optimization mode again. No upstream request is replayed merely
 +because it returns 413.
 +
-+Both limits accept positive decimal byte counts; invalid or nonpositive values
-+use their defaults. An explicit hard request limit remains authoritative, even
-+when lower than the transform limit. Requests exceeding it still receive 413.
++The configured `/compat/headroom/` mount streams requests above the transform
++budget without inspecting or rewriting their body, including signed session
++markers. A declared oversized body streams immediately. Unknown-length uploads
++retain at most the transform budget plus one byte before forwarding that prefix
++and the remaining upload together. This route has no default 100 MiB wire limit;
++large image/audio/video payloads can continue through the existing Headroom route.
++It adds `x-headroom-bypass: true` after header sanitation so Headroom also skips
++body processing. Routing, credentials, cancellation, the SSRF-guarded transport,
++and inbound upload deadlines still apply. Other provider routes retain their
++buffered behavior, including signing adapters that need the whole payload hash.
++
++Both limits accept positive decimal byte counts. Invalid or nonpositive values
++use the defaults (no wire limit on the Headroom streaming route). An explicit
++positive `CAVE_MAX_REQUEST_BYTES` remains authoritative even below the transform
++budget. Known oversized uploads receive 413 before reading or forwarding. An
++unknown-length streamed upload stops at the configured limit and receives 413
++when the upstream transport encounters that read error; it is never replayed.
 +The bypass response carries `x-cave-bypass: request_size`; a structured
 +`event=request_bypass` log records request ID, byte count, and both limits without
 +payloads or credentials. Hard rejections log `event=request_rejected` and the
 +bounded byte count read, which can be a lower bound on the complete upload.
++Streamed uploads also log `event=request_bypass_complete` with bytes consumed by
++the upstream transport and whether the complete-body hash is known. Early
++responses and failed partial uploads never claim a complete hash. Model and
++request-token estimates remain unknown; no savings or price are invented.
 +
 +The buffered path still inspects provider metadata. Parsing, copies, and concurrent
 +requests can consume more memory than the input limit; it is not a process RSS cap.
@@ -33,11 +51,581 @@ index f0356f4..3d6c780 100644
  
  Provider outages, DNS/network loss, sleep-induced socket loss, invalid or expired
  provider credentials, provider context/rate limits, process termination, and
+diff --git a/proxy/internal/gateway/headroom_stream.go b/proxy/internal/gateway/headroom_stream.go
+new file mode 100644
+index 0000000..86c3c4d
+--- /dev/null
++++ b/proxy/internal/gateway/headroom_stream.go
+@@ -0,0 +1,180 @@
++package gateway
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"hash"
++	"io"
++	"net/http"
++	"sync"
++	"time"
++
++	"github.com/JuliusBrussee/caveman/proxy/providers"
++	"github.com/JuliusBrussee/caveman/shared/platform/httpx"
++)
++
++// headroomUpload counts only bytes consumed by the upstream transport. It never
++// retains content. A transport may still be finishing a request-body read when
++// an early response arrives, so snapshots synchronize with that reader.
++type headroomUpload struct {
++	reader io.Reader
++	closer io.Closer
++	mu     sync.Mutex
++	hash   hash.Hash
++	total  int
++	eof    bool
++	err    error
++}
++
++func (u *headroomUpload) Read(p []byte) (int, error) {
++	n, err := u.reader.Read(p)
++	u.mu.Lock()
++	u.total += n
++	_, _ = u.hash.Write(p[:n])
++	if err == io.EOF {
++		u.eof = true
++	} else if err != nil {
++		u.err = err
++	}
++	u.mu.Unlock()
++	return n, err
++}
++
++func (u *headroomUpload) Close() error { return u.closer.Close() }
++
++func (u *headroomUpload) snapshot(length int64) (count int, digest string, complete, limitHit bool) {
++	u.mu.Lock()
++	defer u.mu.Unlock()
++	complete = u.err == nil && ((length < 0 && u.eof) || (length >= 0 && int64(u.total) == length))
++	if complete {
++		digest = hex.EncodeToString(u.hash.Sum(nil))
++	}
++	var limitErr *http.MaxBytesError
++	return u.total, digest, complete, errors.As(u.err, &limitErr)
++}
++
++func (s *Server) rejectHeadroomUpload(w http.ResponseWriter, r *http.Request, requestID string, seen, limit int64) {
++	if s.logger != nil {
++		s.logger.Warn("request exceeds explicit upload limit", "event", "request_rejected",
++			"reason", "request_size", "request_id", requestID, "request_bytes_seen", seen, "request_limit_bytes", limit)
++	}
++	httpx.Error(w, r, http.StatusRequestEntityTooLarge, "cave_request_too_large", "Request body exceeds the configured proxy limit.")
++}
++
++// streamHeadroomUpload preserves the configured adapter/credential/SSRF path,
++// but neither inspects nor rewrites the body. Unlike buffered requests it can
++// never replay, including on a connection error or a provider rejection.
++func (s *Server) streamHeadroomUpload(w http.ResponseWriter, r *http.Request, rc RequestContext, adapter providers.Adapter, credential providers.Credential, authMode AuthMode, source io.Reader, start time.Time, requestID, traceID string, transformLimit, requestLimit int64) {
++	defer r.Body.Close()
++	w.Header().Set("x-cave-bypass", "request_size")
++	if s.logger != nil {
++		s.logger.Info("large upload streams through Headroom without optimization", "event", "request_bypass",
++			"reason", "request_size", "request_id", requestID, "content_length", r.ContentLength,
++			"transform_limit_bytes", transformLimit, "request_limit_bytes", requestLimit)
++	}
++	upstream, err := adapter.ResolveUpstreamURL(r.Context(), r, providers.RouteContext{})
++	if err != nil {
++		httpx.Error(w, r, http.StatusBadGateway, "cave_upstream_unavailable", "Upstream route could not be resolved.")
++		return
++	}
++	headers, err := adapter.SanitizeAndMapHeaders(r.Context(), r, credential, upstream)
++	if err != nil {
++		providerHeaderError(w, r, err)
++		return
++	}
++	if authMode != AuthModePAYG && r.UserAgent() != "" {
++		headers.Set("user-agent", r.UserAgent())
++	}
++	s.applyUpstreamAuthFallback(adapter.Name(), credential, headers)
++	// This is a proxy-owned decision, added only after caller header sanitation.
++	headers.Set("x-headroom-bypass", "true")
++	upload := &headroomUpload{reader: source, closer: r.Body, hash: sha256.New()}
++	upReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstream.String(), upload)
++	if err != nil {
++		httpx.Error(w, r, http.StatusBadRequest, "cave_provider_request_invalid", "Upstream request could not be built.")
++		return
++	}
++	upReq.Header, upReq.ContentLength = headers, r.ContentLength
++	s.inflight.Add(1)
++	resp, err := s.httpClient.Do(upReq)
++	s.inflight.Add(-1)
++	if err != nil {
++		_ = upload.Close()
++		count, _, _, limitHit := upload.snapshot(r.ContentLength)
++		status, code := http.StatusBadGateway, "cave_upstream_unavailable"
++		if limitHit {
++			status, code = http.StatusRequestEntityTooLarge, "cave_request_too_large"
++			s.rejectHeadroomUpload(w, r, requestID, int64(count), requestLimit)
++		} else {
++			httpx.Error(w, r, status, code, "Upstream provider unavailable.")
++		}
++		s.recordHeadroomUpload(r, rc, adapter, authMode, upload, start, requestID, traceID, status, 0, 0, code, providers.UsageObservation{}, false)
++		return
++	}
++	defer resp.Body.Close()
++	copySafeResponseHeaders(w.Header(), resp.Header)
++	w.Header().Set("x-cave-project", rc.Label)
++	w.Header().Set("x-cave-mode", rc.RuntimeMode)
++	w.Header().Set("x-cave-optimization", "none")
++	w.WriteHeader(resp.StatusCode)
++	stream := streamingResponse(resp.Header)
++	usageScanner := adapter.NewUsageScanner(resp.Header)
++	counter, copyError := s.streamResponse(w, r, io.TeeReader(resp.Body, usageScanner), stream, requestID)
++	ttfb := time.Since(start).Milliseconds()
++	if !counter.firstByteAt.IsZero() {
++		ttfb = counter.firstByteAt.Sub(start).Milliseconds()
++	}
++	code := ""
++	if resp.StatusCode >= 400 {
++		code = fmt.Sprintf("provider_%d", resp.StatusCode)
++	}
++	usage := usageScanner.Usage()
++	if usage.ProviderError && code == "" {
++		code = "provider_error"
++		if stream {
++			code = "provider_stream_error"
++		}
++	}
++	if copyError != "" {
++		code = copyError
++	}
++	s.recordHeadroomUpload(r, rc, adapter, authMode, upload, start, requestID, traceID, resp.StatusCode, counter.n, ttfb, code, usage, stream)
++	if copyError != "" {
++		panic(http.ErrAbortHandler)
++	}
++}
++
++func (s *Server) recordHeadroomUpload(r *http.Request, rc RequestContext, adapter providers.Adapter, authMode AuthMode, upload *headroomUpload, start time.Time, requestID, traceID string, status int, responseBytes, ttfb int64, errorCode string, usage providers.UsageObservation, stream bool) {
++	count, digest, complete, _ := upload.snapshot(r.ContentLength)
++	if s.logger != nil {
++		s.logger.Info("streamed Headroom upload finished", "event", "request_bypass_complete", "reason", "request_size",
++			"request_id", requestID, "request_bytes", count, "request_hash_complete", complete,
++			"status", status, "error_code", errorCode, "latency_ms", time.Since(start).Milliseconds())
++	}
++	if complete {
++		body := streamedBody(count, digest)
++		s.capture.record(captureMeta{RequestID: requestID, Provider: adapter.Name(), Endpoint: r.URL.Path, RuntimeMode: "record"}, body, body)
++	}
++	if s.sink == nil {
++		return
++	}
++	evidence := requestEvidenceFromHeaders(r.Header)
++	row := RequestRecord{
++		Timestamp: start.UTC().Format("2006-01-02 15:04:05.000"), RequestID: requestID, TraceID: traceID,
++		Label: labelOrDefault(rc.Label, "local"), AgentSlug: rc.AgentSlug, SessionID: evidence.SessionID,
++		Provider: adapter.Name(), Model: "unknown", Endpoint: r.URL.Path, RouteFrom: r.URL.Path,
++		Stream: stream, StatusCode: status, ErrorCode: errorCode, LatencyMS: time.Since(start).Milliseconds(), TTFBMS: ttfb,
++		RequestBytes: count, ResponseBytes: responseBytes, RawRequestSHA256: digest, TransformedRequestSHA256: digest, RequestHashComplete: complete,
++		AuthMode: string(authMode), RuntimeMode: rc.RuntimeMode, Basis: "inferred", TokenUsageBasis: standaloneUsageBasis(usage),
++		InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens, CachedInputTokens: usage.CachedInputTokens,
++		CacheCreationInputTokens: usage.CacheCreationInputTokens, CacheCreation1hTokens: usage.CacheCreation1hTokens, ReasoningTokens: usage.ReasoningTokens,
++		CacheStatus: usage.CacheStatus,
++	}
++	// There is no parsed model/body to price. Provider usage remains observable,
++	// but request comparisons and savings must not invent a priced baseline.
++	meta := providers.RequestMetadata{Provider: adapter.Name(), Model: "unknown", PricingUnsupportedReason: "request_body_streamed"}
++	requestAccounting(&row, meta, usage, nil, nil, false)
++	s.sink.Record(row)
++}
+diff --git a/proxy/internal/gateway/headroom_stream_test.go b/proxy/internal/gateway/headroom_stream_test.go
+new file mode 100644
+index 0000000..793a6fd
+--- /dev/null
++++ b/proxy/internal/gateway/headroom_stream_test.go
+@@ -0,0 +1,378 @@
++package gateway
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"errors"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"strconv"
++	"strings"
++	"testing"
++	"testing/iotest"
++
++	"github.com/JuliusBrussee/caveman/proxy/providers"
++	"github.com/JuliusBrussee/caveman/proxy/providers/openaicompat"
++)
++
++type uninspectedHeadroomAdapter struct{ providers.Adapter }
++
++func (a uninspectedHeadroomAdapter) InspectRequest(context.Context, providers.BodyReader, http.Header) (providers.RequestMetadata, error) {
++	return providers.RequestMetadata{}, errors.New("streaming request must never be inspected")
++}
++
++func (a uninspectedHeadroomAdapter) ApplyProviderNativeTransforms(context.Context, providers.BodyReader, providers.RequestMetadata, providers.TransformPolicy) (providers.TransformResult, error) {
++	return providers.TransformResult{}, errors.New("streaming request must never be transformed")
++}
++
++type headroomReadProbe struct {
++	reader io.Reader
++	read   int
++}
++
++func (p *headroomReadProbe) Read(b []byte) (int, error) {
++	n, err := p.reader.Read(b)
++	p.read += n
++	return n, err
++}
++
++func headroomStreamServer(t *testing.T, mode string, sink TelemetrySink, transport http.RoundTripper) *Server {
++	t.Helper()
++	adapter, err := openaicompat.NewNamed("headroom", "https://headroom.test/base?configured=1", "ChatGPT-Account-ID")
++	if err != nil {
++		t.Fatal(err)
++	}
++	return New(Config{
++		Adapters: []providers.Adapter{uninspectedHeadroomAdapter{adapter}},
++		Auth:     stubAuth{rc: RequestContext{Label: "test", RuntimeMode: mode}},
++		Creds:    stubCreds{key: "test-key"}, Sink: sink,
++		HTTPClient: &http.Client{Transport: transport},
++	})
++}
++
++func TestHeadroomLargeUploadStreamsBeforeEOF(t *testing.T) {
++	t.Setenv("CAVE_MAX_TRANSFORM_BYTES", "32")
++	t.Setenv("CAVE_MAX_REQUEST_BYTES", "")
++	body := bytes.Repeat([]byte{0, 255, 128, 'm'}, 50)
++	for _, mode := range []string{"compress", "pixel", "cache", "record"} {
++		for _, known := range []bool{true, false} {
++			t.Run(mode+"/known="+strconv.FormatBool(known), func(t *testing.T) {
++				probe := &headroomReadProbe{reader: bytes.NewReader(body)}
++				sink, calls := &captureSink{}, 0
++				srv := headroomStreamServer(t, mode, sink, roundTripFunc(func(r *http.Request) (*http.Response, error) {
++					calls++
++					wantRead := 33
++					wantLength := int64(-1)
++					if known {
++						wantRead, wantLength = 0, int64(len(body))
++					}
++					if probe.read != wantRead || r.ContentLength != wantLength {
++						t.Errorf("before send: consumed=%d want=%d length=%d want=%d", probe.read, wantRead, r.ContentLength, wantLength)
++					}
++					got, err := io.ReadAll(r.Body)
++					if err != nil || !bytes.Equal(got, body) {
++						t.Errorf("stream changed media bytes: len=%d error=%v", len(got), err)
++					}
++					if r.URL.String() != "https://headroom.test/base/v1/responses?configured=1&request=2" ||
++						r.Header.Get("Authorization") != "Bearer test-key" || r.Header.Get("ChatGPT-Account-ID") != "account" ||
++						r.Header.Get("Content-Encoding") != "gzip" || r.Header.Get("X-Headroom-Bypass") != "true" ||
++						r.Header.Get("X-Cave-Private") != "" {
++						t.Errorf("route/header contract changed: URL=%s headers=%v", r.URL, r.Header)
++					}
++					return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader("data: done\n\n"))}, nil
++				}))
++				req := httptest.NewRequest(http.MethodPost, "/compat/headroom/v1/responses?request=2", probe)
++				req.ContentLength = -1
++				if known {
++					req.ContentLength = int64(len(body))
++				}
++				req.Header.Set("Content-Encoding", "gzip")
++				req.Header.Set("ChatGPT-Account-ID", "account")
++				req.Header.Set("X-Cave-Private", "private")
++				rec := httptest.NewRecorder()
++				srv.Handler().ServeHTTP(rec, req)
++				if rec.Code != 200 || calls != 1 || rec.Body.String() != "data: done\n\n" || rec.Header().Get("X-Cave-Bypass") != "request_size" {
++					t.Fatalf("status=%d calls=%d body=%q bypass=%q", rec.Code, calls, rec.Body.String(), rec.Header().Get("X-Cave-Bypass"))
++				}
++				row := sink.last(t)
++				hash := sha256.Sum256(body)
++				if row.RequestBytes != len(body) || !row.RequestHashComplete || row.RawRequestSHA256 != hex.EncodeToString(hash[:]) || row.RawRequestSHA256 != row.TransformedRequestSHA256 ||
++					len(row.OptimizationIDs) != 0 || row.CompressionEligible || row.TotalCostUSD != 0 || row.Model != "unknown" {
++					t.Fatalf("dishonest streamed telemetry: %+v", row)
++				}
++			})
++		}
++	}
++}
++
++func TestHeadroomExplicitUploadCap(t *testing.T) {
++	t.Setenv("CAVE_MAX_TRANSFORM_BYTES", "32")
++	t.Setenv("CAVE_MAX_REQUEST_BYTES", "64")
++	for _, known := range []bool{true, false} {
++		t.Run(strconv.FormatBool(known), func(t *testing.T) {
++			probe := &headroomReadProbe{reader: strings.NewReader(strings.Repeat("x", 65))}
++			calls, received := 0, 0
++			sink := &captureSink{}
++			srv := headroomStreamServer(t, "compress", sink, roundTripFunc(func(r *http.Request) (*http.Response, error) {
++				calls++
++				body, err := io.ReadAll(r.Body)
++				received = len(body)
++				if err == nil {
++					t.Error("over-limit upload must fail its reader")
++				}
++				return nil, err
++			}))
++			req := httptest.NewRequest(http.MethodPost, "/compat/headroom/v1/responses", probe)
++			req.ContentLength = -1
++			if known {
++				req.ContentLength = 65
++			}
++			rec := httptest.NewRecorder()
++			srv.Handler().ServeHTTP(rec, req)
++			if rec.Code != 413 || calls > 1 || received > 64 {
++				t.Fatalf("cap status=%d calls=%d received=%d", rec.Code, calls, received)
++			}
++			if known && (calls != 0 || probe.read != 0) {
++				t.Fatalf("known oversized upload was read/sent: reads=%d calls=%d", probe.read, calls)
++			}
++			if !known {
++				row := sink.last(t)
++				if calls != 1 || row.RequestHashComplete || row.RawRequestSHA256 != "" || row.RequestBytes != 64 {
++					t.Fatalf("cap must not replay or claim complete body: calls=%d row=%+v", calls, row)
++				}
++			}
++		})
++	}
++}
++
++func TestHeadroomStreamFailureDoesNotReplay(t *testing.T) {
++	t.Setenv("CAVE_MAX_TRANSFORM_BYTES", "4")
++	t.Setenv("CAVE_MAX_REQUEST_BYTES", "")
++	for _, cancel := range []bool{false, true} {
++		t.Run(strconv.FormatBool(cancel), func(t *testing.T) {
++			ctx, stop := context.WithCancel(context.Background())
++			defer stop()
++			calls, sink := 0, &captureSink{}
++			srv := headroomStreamServer(t, "compress", sink, roundTripFunc(func(r *http.Request) (*http.Response, error) {
++				calls++
++				if _, err := io.CopyN(io.Discard, r.Body, 2); err != nil {
++					t.Fatal(err)
++				}
++				if cancel {
++					stop()
++					if r.Context().Err() != context.Canceled {
++						t.Error("upstream lost caller cancellation")
++					}
++					return nil, r.Context().Err()
++				}
++				return nil, &net.OpError{Op: "dial", Err: errors.New("connection failed")}
++			}))
++			req := httptest.NewRequest(http.MethodPost, "/compat/headroom/v1/responses", strings.NewReader("large media body")).WithContext(ctx)
++			rec := httptest.NewRecorder()
++			srv.Handler().ServeHTTP(rec, req)
++			row := sink.last(t)
++			if calls != 1 || rec.Code != 502 || row.RequestBytes != 2 || row.RequestHashComplete || row.RawRequestSHA256 != "" || row.TransformedRequestSHA256 != "" {
++				t.Fatalf("failed stream replayed/claimed exact body: calls=%d status=%d row=%+v", calls, rec.Code, row)
++			}
++		})
++	}
++}
++
++type headroomAuthFunc func(context.Context, *http.Request) (RequestContext, error)
++
++func (f headroomAuthFunc) Authenticate(ctx context.Context, r *http.Request) (RequestContext, error) {
++	return f(ctx, r)
++}
++
++func TestHeadroomRejectsUnauthorizedAndUnknownRoutesBeforeReading(t *testing.T) {
++	t.Setenv("CAVE_MAX_TRANSFORM_BYTES", "4")
++	for _, status := range []int{401, 404} {
++		probe := &headroomReadProbe{reader: strings.NewReader("large media body")}
++		srv := headroomStreamServer(t, "compress", nil, roundTripFunc(func(*http.Request) (*http.Response, error) {
++			t.Fatal("rejected request reached transport")
++			return nil, nil
++		}))
++		path := "/compat/headroom/v1/responses"
++		if status == 401 {
++			srv.auth = headroomAuthFunc(func(context.Context, *http.Request) (RequestContext, error) {
++				return RequestContext{}, errors.New("unauthorized")
++			})
++		} else {
++			path = "/compat/other/v1/responses"
++		}
++		rec := httptest.NewRecorder()
++		srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, probe))
++		if rec.Code != status || probe.read != 0 {
++			t.Fatalf("auth/route rejection read request: status=%d want=%d bytes=%d", rec.Code, status, probe.read)
++		}
++	}
++}
++
++func TestHeadroomStreamingDoesNotChangeNextSmallRequestOrOtherMount(t *testing.T) {
++	t.Setenv("CAVE_MAX_TRANSFORM_BYTES", "32")
++	t.Setenv("CAVE_MAX_REQUEST_BYTES", "")
++	for _, mount := range []string{"headroom", "headroom-other"} {
++		adapter, err := openaicompat.NewNamed(mount, "https://headroom.test")
++		if err != nil {
++			t.Fatal(err)
++		}
++		nativeCalls, requests := 0, 0
++		srv := New(Config{
++			Adapters: []providers.Adapter{requestSizeNativeAdapter{Adapter: adapter, calls: &nativeCalls}},
++			Auth:     stubAuth{rc: RequestContext{RuntimeMode: "cache"}}, Creds: stubCreds{},
++			HTTPClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
++				want := ""
++				if mount == "headroom" && requests == 1 {
++					want = "true"
++				}
++				requests++
++				if got := r.Header.Get("X-Headroom-Bypass"); got != want {
++					t.Errorf("mount %s request %d bypass=%q want=%q", mount, requests, got, want)
++				}
++				_, _ = io.Copy(io.Discard, r.Body)
++				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
++			})},
++		})
++		for _, length := range []int{32, 33, 32} {
++			body := `{"model":"test"}` + strings.Repeat(" ", length-len(`{"model":"test"}`))
++			req := httptest.NewRequest(http.MethodPost, "/compat/"+mount+"/v1/responses", strings.NewReader(body))
++			req.Header.Set("X-Headroom-Bypass", "caller-controlled")
++			rec := httptest.NewRecorder()
++			srv.Handler().ServeHTTP(rec, req)
++			if rec.Code != 200 {
++				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
++			}
++		}
++		if nativeCalls != 2 || requests != 3 {
++			t.Fatalf("mount %s lost small-request transforms: calls=%d requests=%d", mount, nativeCalls, requests)
++		}
++	}
++}
++
++type headroomZeroReader struct{}
++
++func (headroomZeroReader) Read(p []byte) (int, error) { clear(p); return len(p), nil }
++
++func TestHeadroomDefaultAllowsUploadBeyond100MiB(t *testing.T) {
++	t.Setenv("CAVE_MAX_TRANSFORM_BYTES", "32")
++	t.Setenv("CAVE_MAX_REQUEST_BYTES", "")
++	const size = 100<<20 + 1
++	sink := &captureSink{}
++	srv := headroomStreamServer(t, "compress", sink, roundTripFunc(func(r *http.Request) (*http.Response, error) {
++		count, err := io.Copy(io.Discard, r.Body)
++		if count != size || err != nil {
++			t.Errorf("large raw upload count=%d error=%v", count, err)
++		}
++		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
++	}))
++	req := httptest.NewRequest(http.MethodPost, "/compat/headroom/v1/responses", io.LimitReader(headroomZeroReader{}, size))
++	req.ContentLength = size
++	rec := httptest.NewRecorder()
++	srv.Handler().ServeHTTP(rec, req)
++	if rec.Code != 200 || sink.last(t).RequestBytes != size {
++		t.Fatalf("default hard cap survived: status=%d", rec.Code)
++	}
++}
++
++func TestHeadroomEarlyRejectionDoesNotReplayOrClaimFullHash(t *testing.T) {
++	t.Setenv("CAVE_MAX_TRANSFORM_BYTES", "4")
++	t.Setenv("CAVE_MAX_REQUEST_BYTES", "")
++	calls, sink := 0, &captureSink{}
++	srv := headroomStreamServer(t, "compress", sink, roundTripFunc(func(r *http.Request) (*http.Response, error) {
++		calls++
++		_, _ = io.CopyN(io.Discard, r.Body, 2)
++		return &http.Response{StatusCode: 413, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("provider limit"))}, nil
++	}))
++	rec := httptest.NewRecorder()
++	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/compat/headroom/v1/responses", strings.NewReader("large media body")))
++	row := sink.last(t)
++	if calls != 1 || rec.Code != 413 || rec.Body.String() != "provider limit" || row.RequestBytes != 2 || row.RequestHashComplete || row.RawRequestSHA256 != "" {
++		t.Fatalf("early rejection replayed/claimed full body: calls=%d status=%d row=%+v", calls, rec.Code, row)
++	}
++}
++
++func TestHeadroomInterruptedResponseAbortsFraming(t *testing.T) {
++	t.Setenv("CAVE_MAX_TRANSFORM_BYTES", "4")
++	t.Setenv("CAVE_MAX_REQUEST_BYTES", "")
++	calls, sink := 0, &captureSink{}
++	srv := headroomStreamServer(t, "compress", sink, roundTripFunc(func(r *http.Request) (*http.Response, error) {
++		calls++
++		_, _ = io.Copy(io.Discard, r.Body)
++		body := io.MultiReader(strings.NewReader("data: partial\n\n"), iotest.ErrReader(io.ErrUnexpectedEOF))
++		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(body)}, nil
++	}))
++	rec := httptest.NewRecorder()
++	defer func() {
++		if recovered := recover(); recovered != http.ErrAbortHandler {
++			t.Fatalf("incomplete stream must abort framing, got %v", recovered)
++		}
++		if calls != 1 || rec.Body.String() != "data: partial\n\n" || sink.last(t).ErrorCode != "cave_upstream_body_read_failed" {
++			t.Fatalf("partial response hidden/replayed: calls=%d body=%q row=%+v", calls, rec.Body.String(), sink.last(t))
++		}
++	}()
++	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/compat/headroom/v1/responses", strings.NewReader("large media body")))
++}
++
++func TestHeadroomHardCapBelowTransformThreshold(t *testing.T) {
++	t.Setenv("CAVE_MAX_TRANSFORM_BYTES", "32")
++	t.Setenv("CAVE_MAX_REQUEST_BYTES", "16")
++	srv := headroomStreamServer(t, "compress", nil, roundTripFunc(func(*http.Request) (*http.Response, error) {
++		t.Fatal("over-limit buffered upload must not reach upstream")
++		return nil, nil
++	}))
++	for _, length := range []int64{17, -1} {
++		req := httptest.NewRequest(http.MethodPost, "/compat/headroom/v1/responses", strings.NewReader(strings.Repeat("x", 17)))
++		req.ContentLength = length
++		rec := httptest.NewRecorder()
++		srv.Handler().ServeHTTP(rec, req)
++		if rec.Code != 413 {
++			t.Fatalf("cap below transform limit ignored: status=%d", rec.Code)
++		}
++	}
++}
++
++func TestHeadroomExplicitLimitAllowsExactLength(t *testing.T) {
++	t.Setenv("CAVE_MAX_TRANSFORM_BYTES", "4")
++	t.Setenv("CAVE_MAX_REQUEST_BYTES", "16")
++	for _, length := range []int64{16, -1} {
++		sink := &captureSink{}
++		srv := headroomStreamServer(t, "compress", sink, roundTripFunc(func(r *http.Request) (*http.Response, error) {
++			count, err := io.Copy(io.Discard, r.Body)
++			if count != 16 || err != nil {
++				t.Errorf("exact-limit upload failed: count=%d error=%v", count, err)
++			}
++			return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
++		}))
++		req := httptest.NewRequest(http.MethodPost, "/compat/headroom/v1/responses", strings.NewReader(strings.Repeat("x", 16)))
++		req.ContentLength = length
++		rec := httptest.NewRecorder()
++		srv.Handler().ServeHTTP(rec, req)
++		if rec.Code != 200 || !sink.last(t).RequestHashComplete {
++			t.Fatalf("exact-limit upload rejected: status=%d row=%+v", rec.Code, sink.last(t))
++		}
++	}
++}
++
++func TestHeadroomEarlyEOFMustMatchDeclaredLengthForCompleteHash(t *testing.T) {
++	t.Setenv("CAVE_MAX_TRANSFORM_BYTES", "4")
++	t.Setenv("CAVE_MAX_REQUEST_BYTES", "")
++	sink := &captureSink{}
++	srv := headroomStreamServer(t, "compress", sink, roundTripFunc(func(r *http.Request) (*http.Response, error) {
++		count, err := io.Copy(io.Discard, r.Body)
++		if count != 2 || err != nil {
++			t.Fatalf("fixture must end cleanly after two bytes: count=%d error=%v", count, err)
++		}
++		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
++	}))
++	req := httptest.NewRequest(http.MethodPost, "/compat/headroom/v1/responses", strings.NewReader("ab"))
++	req.ContentLength = 20
++	srv.Handler().ServeHTTP(httptest.NewRecorder(), req)
++	row := sink.last(t)
++	if row.RequestBytes != 2 || row.RequestHashComplete || row.RawRequestSHA256 != "" || row.TransformedRequestSHA256 != "" {
++		t.Fatalf("early EOF claimed all declared bytes: %+v", row)
++	}
++}
 diff --git a/proxy/internal/gateway/proxy.go b/proxy/internal/gateway/proxy.go
-index c5ed1c7..1722f19 100644
+index c5ed1c7..2cfd1cf 100644
 --- a/proxy/internal/gateway/proxy.go
 +++ b/proxy/internal/gateway/proxy.go
-@@ -115,7 +115,16 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
+@@ -115,17 +115,72 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
  	// always present. Telemetry-only: it never gates routing or transforms.
  	rc.AgentSlug = labelOrDefault(r.Header.Get("x-cave-agent"), "unlabeled-agent")
  
@@ -49,15 +637,48 @@ index c5ed1c7..1722f19 100644
 +		maxBytes = 100 << 20
 +	}
 +	maxTransformBytes := int64(env.Int("CAVE_MAX_TRANSFORM_BYTES", 32<<20))
-+	if maxTransformBytes <= 0 {
++	if maxTransformBytes <= 0 || maxTransformBytes == 1<<63-1 {
 +		maxTransformBytes = 32 << 20
 +	}
++	// Headroom can forward media without parsing it. Keep this path scoped to
++	// that named mount: signing adapters still require the complete wire body.
++	headroomStream := adapter.Name() == "openai_compatible" && strings.HasPrefix(r.URL.Path, "/compat/headroom/")
++	headroomLimit := int64(0)
++	if headroomStream {
++		headroomLimit = int64(env.Int("CAVE_MAX_REQUEST_BYTES", 0))
++		if headroomLimit > 0 {
++			if r.ContentLength > headroomLimit {
++				s.rejectHeadroomUpload(w, r, requestID, r.ContentLength, headroomLimit)
++				return
++			}
++			r.Body = http.MaxBytesReader(w, r.Body, headroomLimit)
++		} else {
++			headroomLimit = 0
++		}
++		if r.ContentLength > maxTransformBytes {
++			s.streamHeadroomUpload(w, r, rc, adapter, credential, authMode, r.Body, start, requestID, traceID, maxTransformBytes, headroomLimit)
++			return
++		}
++		maxBytes = maxTransformBytes
++	}
  	body, err := io.ReadAll(io.LimitReader(r.Body, maxBytes+1))
- 	_ = r.Body.Close()
+-	_ = r.Body.Close()
  	if err != nil {
-@@ -123,9 +132,23 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
++		_ = r.Body.Close()
++		var limitErr *http.MaxBytesError
++		if headroomStream && errors.As(err, &limitErr) {
++			s.rejectHeadroomUpload(w, r, requestID, int64(len(body)), headroomLimit)
++			return
++		}
+ 		httpx.Error(w, r, http.StatusBadRequest, "cave_request_read_failed", "Request body could not be read completely.")
  		return
  	}
++	if headroomStream && int64(len(body)) > maxTransformBytes {
++		source := io.MultiReader(bytes.NewReader(body), r.Body)
++		s.streamHeadroomUpload(w, r, rc, adapter, credential, authMode, source, start, requestID, traceID, maxTransformBytes, headroomLimit)
++		return
++	}
++	_ = r.Body.Close()
  	if int64(len(body)) > maxBytes {
 +		if s.logger != nil {
 +			s.logger.Warn("request exceeds hard upload limit", "event", "request_rejected",
@@ -79,7 +700,7 @@ index c5ed1c7..1722f19 100644
  	body, correlatedSessionID, _ := nativeruntime.StripSessionMarkers(body, s.sessionMarkerKey)
  	if strings.HasPrefix(labelOrDefault(rc.Label, "local"), "trial:") {
  		if payloads, ok := s.sink.(PayloadSink); ok {
-@@ -135,7 +158,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
+@@ -135,7 +190,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
  	rawHash := sha256.Sum256(body)
  	// Decide after reading: standalone clients prove recovery with their request's
  	// namespaced caveman retrieve tool; wrap may prove it out of band.
@@ -88,7 +709,7 @@ index c5ed1c7..1722f19 100644
  	subscriptionPassthrough := authMode == AuthModeSubscription && !nonPAYGLiveZone
  	evidence := requestEvidenceFromHeaders(r.Header)
  	evidence.originalBody = body
-@@ -186,7 +209,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
+@@ -186,7 +241,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
  	compressionEligible := false
  	effectiveRuntimeMode := rc.RuntimeMode
  	reqContentEncoding := strings.TrimSpace(r.Header.Get("Content-Encoding"))
@@ -97,7 +718,7 @@ index c5ed1c7..1722f19 100644
  		(reqContentEncoding != "" && !strings.EqualFold(reqContentEncoding, "identity")) {
  		// Framework callers use this request-wide opt-out when their result contract
  		// cannot observe or recover transformed bytes. It suppresses compression,
-@@ -208,7 +231,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
+@@ -208,7 +263,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
  		// ApplyResolvedPricingRoute below. `estimate` is written by exactly one
  		// goroutine and read only after estimateWG.Wait() (which establishes the
  		// happens-before), so every record() consumer sees a fully-computed value.
@@ -106,7 +727,7 @@ index c5ed1c7..1722f19 100644
  			estimateWG.Add(1)
  			go func(m providers.RequestMetadata) {
  				defer estimateWG.Done()
-@@ -341,7 +364,11 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
+@@ -341,7 +396,11 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
  	}
  	transformedHash := sha256.Sum256(transform.Body)
  	evidence.acceptedBody = transform.Body

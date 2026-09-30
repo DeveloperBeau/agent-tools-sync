@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import plistlib
 import subprocess
@@ -32,9 +33,9 @@ SAMPLE_LIMIT = 360
 RECOVERABLE = frozenset({"sse_error", "missing_terminal_event", "interrupted"})
 
 
-def recovery_candidate(routes: dict, last_attempt: float, now: float) -> str | None:
-    if now - last_attempt < COOLDOWN_SECONDS:
-        return None
+def recovery_candidates(routes: dict) -> list[str]:
+    """Detect failures independently of whether another restart is allowed."""
+    failed = []
     for route in ("codex", "claude"):
         health = routes.get(route) or {}
         if (
@@ -44,8 +45,8 @@ def recovery_candidate(routes: dict, last_attempt: float, now: float) -> str | N
                 or str(health.get("last_reason", "")).startswith("http_5")
             )
         ):
-            return route
-    return None
+            failed.append(route)
+    return failed
 
 
 def _get_json(url: str) -> dict:
@@ -274,13 +275,40 @@ def capture() -> None:
     print(f"Captured proxy evidence: {path}")
 
 
-def recover(route: str, routes: dict, state: dict, now: float) -> None:
+def _report_cooldown_failure(route: str, routes: dict, state: dict, now: float, remaining: int) -> None:
+    alerts = state.setdefault("cooldown_alerts", {})
+    reason = str((routes.get(route) or {}).get("last_reason") or routes.get("probe_error") or "unhealthy")[:80]
+    previous = alerts.get(route)
+    if previous and previous.get("last_attempt") == state["last_attempt"]:
+        previous.update(failure_reason=reason, cooldown_remaining_seconds=remaining)
+        _save_json(STATE_PATH, state)
+        return
+    incident_path, incident = _capture_incident(route, routes, state)
+    suppression = {"reason": "restart_cooldown", "failure_reason": reason,
+                   "last_attempt": state["last_attempt"], "cooldown_remaining_seconds": remaining}
+    incident["recovery_suppressed"] = suppression
+    _save_json(incident_path, incident)
+    alerts[route] = {**suppression, "detected_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+                     "incident": str(incident_path)}
+    state["incident"] = str(incident_path)
+    _save_json(STATE_PATH, state)
+    _notify(f"{route} failure; restart delayed by cooldown ({remaining}s). Evidence captured.")
+    print(json.dumps({"time": datetime.now(timezone.utc).isoformat(), "event": "recovery_suppressed",
+                      "route": route, **suppression, "incident": str(incident_path)}), flush=True)
+
+
+def recover(route: str, routes: dict, state: dict, now: float) -> bool:
     # A deliberately unloaded service must stay stopped. KeepAlive handles
     # crashes; a loaded but unresponsive service still needs recovery.
     if not _managed_headroom_loaded():
-        return
+        return False
+    last_attempt = state.get("last_attempt", 0)
+    remaining = max(0, math.ceil(last_attempt + COOLDOWN_SECONDS - now)) if last_attempt else 0
+    if remaining:
+        _report_cooldown_failure(route, routes, state, now, remaining)
+        return False
     incident_path, incident = _capture_incident(route, routes, state)
-    state.update(last_attempt=now, incident=str(incident_path))
+    state.update(last_attempt=now, incident=str(incident_path), cooldown_alerts={})
     _save_json(STATE_PATH, state)
     incident["restart"] = _restart_headroom()
     incident["ready_after_restart"] = _ready_after_restart()
@@ -296,6 +324,7 @@ def recover(route: str, routes: dict, state: dict, now: float) -> None:
     )
     _notify(message)
     print(f"{datetime.now(timezone.utc).isoformat()} {message} {incident_path}", flush=True)
+    return True
 
 
 def watch() -> None:
@@ -336,8 +365,8 @@ def _watch() -> None:
                 routes = _get_json(ROUTE_URL)
             except (OSError, ValueError, HTTPException) as error:
                 probe_failures += 1
-                if probe_failures >= 3 and now - state.get("last_attempt", 0) >= COOLDOWN_SECONDS:
-                    recover("headroom_health_endpoint", {"probe_error": str(error)}, state, now)
+                if probe_failures >= 3:
+                    recover("headroom_health_endpoint", {"probe_error": type(error).__name__}, state, now)
                     probe_failures = 0
                 raise
             probe_failures = 0
@@ -345,9 +374,10 @@ def _watch() -> None:
             state["last_routes"] = routes
             state["last_poll"] = datetime.now(timezone.utc).isoformat()
             _save_json(STATE_PATH, state)
-            route = recovery_candidate(routes, state.get("last_attempt", 0), now)
-            if route is not None:
-                recover(route, routes, state, now)
+            for route in recovery_candidates(routes):
+                if recover(route, routes, state, now):
+                    # A restart invalidates this snapshot of both routes.
+                    break
         except (OSError, ValueError, TypeError, HTTPException) as error:
             message = f"{type(error).__name__}: {error}"
             if message != last_error:
