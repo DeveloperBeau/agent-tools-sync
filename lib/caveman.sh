@@ -34,6 +34,73 @@ caveman_version_string() {
 CAVEMAN_CONFIG_FILE="$HOME/.caveman/caveman.yaml"
 CAVEMAN_CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 CAVEMAN_CODEX_CONFIG="$HOME/.codex/config.toml"
+CAVEMAN_CODEX_HOOKS="$HOME/.codex/hooks.json"
+CAVEMAN_MANAGED_PROXY_BIN="$HOME/.caveman/bin/caveman-proxy"
+CAVEMAN_PRIVATE_PROXY_BIN="$HOME/.caveman/ats-proxy/caveman-proxy"
+CAVEMAN_PROXY_LOG="$HOME/.caveman/proxy.log"
+CAVEMAN_PROXY_INSTALLER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/install_caveman_proxy.py"
+CAVEMAN_PROXY_BIN="${CAVEMAN_PROXY_BIN:-$CAVEMAN_MANAGED_PROXY_BIN}"
+
+caveman_select_proxy() {
+  case "$CAVEMAN_PROXY_BIN" in
+    "$CAVEMAN_MANAGED_PROXY_BIN"|"$CAVEMAN_PRIVATE_PROXY_BIN") ;;
+    *) export CAVEMAN_PROXY_BIN; return ;;
+  esac
+  if [ -x "$CAVEMAN_PRIVATE_PROXY_BIN" ]; then
+    CAVEMAN_PROXY_BIN="$CAVEMAN_PRIVATE_PROXY_BIN"
+  fi
+  export CAVEMAN_PROXY_BIN
+}
+caveman_select_proxy
+
+caveman_ensure_proxy_override() {
+  local rc="$1" line
+  [ -f "$rc" ] || return 0
+  printf -v line 'export CAVEMAN_PROXY_BIN=%q' "$CAVEMAN_PROXY_BIN"
+  grep -Fqx "$line" "$rc" && return 0
+  printf '\n# ATS patched Caveman proxy (preserved across vendor updates).\n%s\n' "$line" >> "$rc"
+}
+
+# Only migrate the native hook command previously installed by Caveman.
+# Custom executable paths remain the user's choice.
+caveman_migrate_native_proxy() {
+  [ "$CAVEMAN_PROXY_BIN" = "$CAVEMAN_PRIVATE_PROXY_BIN" ] || return 1
+  local cfg
+  case "$1" in
+    claude) cfg="$CAVEMAN_CLAUDE_SETTINGS" ;;
+    codex) cfg="$CAVEMAN_CODEX_HOOKS" ;;
+    *) return 1 ;;
+  esac
+  python3 - "$cfg" "$CAVEMAN_MANAGED_PROXY_BIN" "$1" "$CAVEMAN_PRIVATE_PROXY_BIN" <<'PY'
+import json, os, shlex, stat, sys, tempfile
+from pathlib import Path
+path = Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text())
+    changed = False
+    for entries in data.get("hooks", {}).values():
+        for entry in entries:
+            for hook in entry.get("hooks", []):
+                args = list(shlex.shlex(hook.get("command", ""), posix=True, punctuation_chars=True))
+                if (len(args) == 5 and args[:4] == [sys.argv[2], "native-hook", sys.argv[3], "--adapter"]):
+                    hook["command"] = shlex.join([sys.argv[4], *args[1:]])
+                    changed = True
+    if changed:
+        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as output:
+            temporary = Path(output.name)
+            try:
+                output.write(json.dumps(data, indent=2) + "\n")
+                output.flush()
+                os.fchmod(output.fileno(), stat.S_IMODE(path.stat().st_mode))
+                temporary.replace(path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        raise SystemExit(0)
+except (OSError, ValueError, TypeError, AttributeError):
+    pass
+raise SystemExit(1)
+PY
+}
 
 # caveman_yaml_has_headroom_stack YAML_TEXT — 0 if caveman.yaml already runs
 # in compress mode with the compat.headroom mount pointed at headroom's port.
@@ -68,15 +135,29 @@ install_caveman() {
     ok "installed ($(caveman_version_string "$(caveman --version 2>/dev/null)"))"
     run npm update -g @caveman-ai/cli --allow-scripts=pnpm >/dev/null
   fi
+  if ! run python3 "$CAVEMAN_PROXY_INSTALLER"; then
+    warn "patched Caveman build unavailable; keeping the existing proxy"
+  fi
+  caveman_select_proxy
+  if [ "$CAVEMAN_PROXY_BIN" = "$CAVEMAN_PRIVATE_PROXY_BIN" ]; then
+    caveman_ensure_proxy_override "$HOME/.zshrc"
+    caveman_ensure_proxy_override "$HOME/.bashrc"
+  fi
 }
 
 caveman_ensure_agent() {
   local status_text="$1" agent="$2" label="$3"
-  if caveman_agent_installed "$status_text" "$agent"; then
+  if caveman_migrate_native_proxy "$agent"; then
+    ok "$label native hooks now use the patched proxy"
+    return
+  elif caveman_agent_installed "$status_text" "$agent"; then
     skip "$label integration already installed"
+    return
   elif caveman_route_patched "$agent"; then
     skip "$label integration active through headroom"
-  elif run caveman enable "$agent"; then
+    return
+  fi
+  if run caveman enable "$agent"; then
     ok "$label integration installed"
   else
     warn "$label integration failed"
@@ -86,8 +167,8 @@ caveman_ensure_agent() {
 # caveman_start_proxy — starts caveman-proxy directly if it isn't already
 # running. Caveman has no CLI verb for this either (it normally lazy-starts
 # on the next `claude`/`codex` session); ats start needs it back now.
-CAVEMAN_PROXY_BIN="$HOME/.caveman/bin/caveman-proxy"
 caveman_start_proxy() {
+  caveman_select_proxy
   if pgrep -f caveman-proxy >/dev/null 2>&1; then
     ok "proxy already running on :8787"
     return
@@ -96,7 +177,10 @@ caveman_start_proxy() {
     skip "caveman-proxy binary not found at $CAVEMAN_PROXY_BIN — it will self-start on the next claude/codex session"
     return
   fi
-  nohup "$CAVEMAN_PROXY_BIN" >/dev/null 2>&1 &
+  mkdir -p "$(dirname "$CAVEMAN_PROXY_LOG")" || return 1
+  (umask 077; touch "$CAVEMAN_PROXY_LOG") || return 1
+  chmod 600 "$CAVEMAN_PROXY_LOG" || return 1
+  nohup "$CAVEMAN_PROXY_BIN" >>"$CAVEMAN_PROXY_LOG" 2>&1 &
   sleep 1
   if pgrep -f caveman-proxy >/dev/null 2>&1; then
     ok "proxy started on :8787"
@@ -237,13 +321,16 @@ caveman_patch_codex_route() {
 
 setup_caveman() {
   section "caveman"
-  local previous_version="" current_version
+  local previous_version="" current_version previous_proxy current_proxy
+  previous_proxy="$(cksum "$CAVEMAN_PRIVATE_PROXY_BIN.bin" 2>/dev/null)"
   have caveman && previous_version="$(caveman --version 2>/dev/null)"
   install_caveman
   have caveman || { warn "caveman not on PATH after install — skipping rest"; return; }
   current_version="$(caveman --version 2>/dev/null)"
-  if [ -n "$previous_version" ] && [ -n "$current_version" ] &&
-     [ "$previous_version" != "$current_version" ] &&
+  current_proxy="$(cksum "$CAVEMAN_PRIVATE_PROXY_BIN.bin" 2>/dev/null)"
+  if { { [ -n "$previous_version" ] && [ -n "$current_version" ] &&
+         [ "$previous_version" != "$current_version" ]; } ||
+       { [ -n "$current_proxy" ] && [ "$previous_proxy" != "$current_proxy" ]; }; } &&
      pgrep -f caveman-proxy >/dev/null 2>&1; then
     caveman_stop_proxy
     sleep 1

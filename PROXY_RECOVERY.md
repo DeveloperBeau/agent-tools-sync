@@ -112,22 +112,35 @@ stopped sending. No transport settings, retry policy, or restart criteria change
 with these diagnostics. Preserve reports before making further changes. A
 completed request on one route does not establish health of the other route.
 
-## Caveman rejects an oversized request
+## Automatic Caveman size bypass
 
-`Request body exceeds the proxy limit.` from `:8787` is Caveman's inbound
-32 MiB limit. It runs before compression, pass-through mode, and request logging;
-there is no automatic bypass for this rejection. To run Codex directly through
-the Headroom diagnostic fork for one session:
+The patched Caveman proxy automatically skips optimization for requests above
+32 MiB and forwards them through the configured Headroom route. The next smaller
+request uses compression normally. No command or provider switch is needed.
+Authentication, SSRF checks, header mapping, native session-marker cleanup,
+streaming, and existing retry rules remain in place. An upstream error on an
+unmodified request is returned without replaying that request.
 
-```sh
-codex -c 'model_provider="headroom"' \
-  -c 'model_providers.headroom.base_url="http://127.0.0.1:8788/v1"'
-```
+`CAVE_MAX_TRANSFORM_BYTES` controls the compression ceiling (default 32 MiB).
+`CAVE_MAX_REQUEST_BYTES` remains the hard upload ceiling (default 100 MiB);
+explicit positive overrides remain authoritative. Headroom also limits wire and
+decompressed bodies to 100 MiB. A hard-limit rejection still returns 413.
+Buffering and metadata parsing can use more memory than the input byte limit.
 
-This uses the compatibility provider registered by ATS and leaves global routing
-unchanged. Headroom has its own 100 MiB wire/decompressed-body ceiling. Caveman's
-ceiling can instead be raised with `CAVE_MAX_REQUEST_BYTES` in its launcher
-environment, but changing a shell variable cannot alter an already-running proxy.
+Responses disclose size bypass with `x-cave-bypass: request_size`. Private
+`~/.caveman/proxy.log` records `event=request_bypass`, request ID, size, and both
+limits without payloads or credentials. Hard rejections record
+`event=request_rejected` and bytes seen, which may be less than the full upload.
+
+ATS builds the pinned upstream revision plus `patches/caveman-request-size.patch`
+using `lib/install_caveman_proxy.py`. Its private wrapper and executable live in
+`~/.caveman/ats-proxy/`; the wrapper exports `CAVEMAN_PROXY_BIN` so native hooks
+and their child CLI processes use the same build. Vendor-managed binaries remain
+separate. ATS persists the override for shell launches and migrates vendor-owned
+native hook commands. Go is required to build or update the patch; a failed build
+keeps the previously installed executable. `build.json` records the source,
+patch, and binary hashes. To update the pin, rebase the tracked patch and rerun
+its gateway and installer checks before replacing the running proxy.
 
 ## Rollback
 

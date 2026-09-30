@@ -177,4 +177,62 @@ if have node; then
   rm -f "$tmp_settings"
 fi
 
+# --- durable private proxy selection / native lifecycle --------------------
+caveman_private_lifecycle_check() (
+  local root managed CAVEMAN_PRIVATE_PROXY_BIN CAVEMAN_PROXY_BIN CAVEMAN_MANAGED_PROXY_BIN
+  local CAVEMAN_CODEX_HOOKS CAVEMAN_PROXY_LOG enabled="" probes=0
+  root="$(mktemp -d)"
+  trap 'rm -rf "$root"' EXIT
+  CAVEMAN_MANAGED_PROXY_BIN="$root/vendor/caveman-proxy"
+  CAVEMAN_PRIVATE_PROXY_BIN="$root/private/caveman-proxy"
+  CAVEMAN_PROXY_BIN="$CAVEMAN_MANAGED_PROXY_BIN"
+  CAVEMAN_CODEX_HOOKS="$root/hooks.json"
+  CAVEMAN_PROXY_LOG="$root/proxy.log"
+  mkdir -p "$root/private" "$root/vendor"
+  printf '#!/bin/sh\n' > "$CAVEMAN_PRIVATE_PROXY_BIN"
+  chmod +x "$CAVEMAN_PRIVATE_PROXY_BIN"
+  caveman_select_proxy || return
+  [ "$CAVEMAN_PROXY_BIN" = "$CAVEMAN_PRIVATE_PROXY_BIN" ] || return 1
+  CAVEMAN_PROXY_BIN=/user/custom-proxy
+  caveman_select_proxy || return
+  [ "$CAVEMAN_PROXY_BIN" = /user/custom-proxy ] || return 1
+  CAVEMAN_PROXY_BIN="$CAVEMAN_PRIVATE_PROXY_BIN"
+  printf '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"%s native-hook codex --adapter /old/cli.js"},{"type":"command","command":"/user/custom-hook"}]}]}}' "$CAVEMAN_MANAGED_PROXY_BIN" > "$CAVEMAN_CODEX_HOOKS"
+  caveman() { [ "$1" = enable ] && enabled="$2:$CAVEMAN_PROXY_BIN"; }
+  caveman_ensure_agent $'codex installed' codex Codex >/dev/null
+  [ -z "$enabled" ] || return 1
+  python3 - "$CAVEMAN_CODEX_HOOKS" "$CAVEMAN_PRIVATE_PROXY_BIN" <<'PY' || return 1
+import json, shlex, sys
+with open(sys.argv[1]) as source:
+    hooks = json.load(source)["hooks"]["SessionStart"][0]["hooks"]
+assert shlex.split(hooks[0]["command"]) == [sys.argv[2], "native-hook", "codex", "--adapter", "/old/cli.js"]
+assert hooks[1]["command"] == "/user/custom-hook"
+PY
+  local migrated
+  migrated="$(cat "$CAVEMAN_CODEX_HOOKS")"
+  caveman_ensure_agent $'codex installed' codex Codex >/dev/null
+  [ "$migrated" = "$(cat "$CAVEMAN_CODEX_HOOKS")" ] || return 1
+  [ -z "$enabled" ] || return 1
+  enabled=""
+  printf '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"/user/custom-proxy native-hook codex"}]}]}}' > "$CAVEMAN_CODEX_HOOKS"
+  caveman_ensure_agent $'codex installed' codex Codex >/dev/null
+  [ -z "$enabled" ] || return 1
+  pgrep() { probes=$((probes + 1)); [ "$probes" -gt 1 ]; }
+  nohup() { printf 'caveman bypass diagnostic\n'; }
+  sleep() { wait; }
+  caveman_start_proxy >/dev/null
+  grep -q 'caveman bypass diagnostic' "$CAVEMAN_PROXY_LOG"
+)
+check "private proxy: selected for native migration/start; user hooks preserved; output persisted" caveman_private_lifecycle_check
+
+tmp_rc="$(mktemp)"
+CAVEMAN_PROXY_BIN='/tmp/private proxy/caveman-proxy' caveman_ensure_proxy_override "$tmp_rc" >/dev/null
+after_first="$(cat "$tmp_rc")"
+CAVEMAN_PROXY_BIN='/tmp/private proxy/caveman-proxy' caveman_ensure_proxy_override "$tmp_rc" >/dev/null
+assert_eq "private proxy: shell override is idempotent" "$after_first" "$(cat "$tmp_rc")"
+assert_eq "private proxy: shell override preserves spaces" '/tmp/private proxy/caveman-proxy' \
+  "$(bash -c 'source "$1"; printf "%s" "$CAVEMAN_PROXY_BIN"' bash "$tmp_rc")"
+rm -f "$tmp_rc"
+check "private proxy: pinned install, atomic failure fallback and wrapper delegation" python3 "$HERE/test_caveman_install.py"
+
 report

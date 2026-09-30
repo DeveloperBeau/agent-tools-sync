@@ -1,0 +1,307 @@
+diff --git a/docs/technical/proxy-reliability.md b/docs/technical/proxy-reliability.md
+index f0356f4..3d6c780 100644
+--- a/docs/technical/proxy-reliability.md
++++ b/docs/technical/proxy-reliability.md
+@@ -87,9 +87,27 @@ client timeout remains active while reading the response body.
+ There is no proxy session TTL. An idle HTTP keep-alive connection can still be
+ closed and reopened normally; this is separate from listener or generation
+ lifetime. TCP/TLS setup remains bounded, as do the wait for the first upstream
+-response header, inbound headers/uploads, and request/response buffering. Default general request buffer is 32 MiB; default
+-non-streaming response buffer is 64 MiB. The ChatGPT route streams larger
+-request bodies instead of transforming them.
++response header, inbound headers/uploads, and request/response buffering. The
++general request buffer defaults to 100 MiB (`CAVE_MAX_REQUEST_BYTES`). Requests
++above 32 MiB (`CAVE_MAX_TRANSFORM_BYTES`) automatically skip every transform,
++compression estimate, and prefix scan for that request. They keep the normal
++authentication, route, header mapping, upstream transport, and response handling;
++native signed session markers are still removed. The next smaller request uses
++the configured optimization mode again. No upstream request is replayed merely
++because it returns 413.
++
++Both limits accept positive decimal byte counts; invalid or nonpositive values
++use their defaults. An explicit hard request limit remains authoritative, even
++when lower than the transform limit. Requests exceeding it still receive 413.
++The bypass response carries `x-cave-bypass: request_size`; a structured
++`event=request_bypass` log records request ID, byte count, and both limits without
++payloads or credentials. Hard rejections log `event=request_rejected` and the
++bounded byte count read, which can be a lower bound on the complete upload.
++
++The buffered path still inspects provider metadata. Parsing, copies, and concurrent
++requests can consume more memory than the input limit; it is not a process RSS cap.
++The default non-streaming response buffer is 64 MiB. The separate ChatGPT route
++streams larger request bodies instead of transforming them.
+ 
+ Provider outages, DNS/network loss, sleep-induced socket loss, invalid or expired
+ provider credentials, provider context/rate limits, process termination, and
+diff --git a/proxy/internal/gateway/proxy.go b/proxy/internal/gateway/proxy.go
+index c5ed1c7..1722f19 100644
+--- a/proxy/internal/gateway/proxy.go
++++ b/proxy/internal/gateway/proxy.go
+@@ -115,7 +115,16 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
+ 	// always present. Telemetry-only: it never gates routing or transforms.
+ 	rc.AgentSlug = labelOrDefault(r.Header.Get("x-cave-agent"), "unlabeled-agent")
+ 
+-	maxBytes := int64(env.Int("CAVE_MAX_REQUEST_BYTES", 33554432))
++	// The upload ceiling and the optimization budget serve different purposes:
++	// a request too expensive to optimize can still use the normal transport.
++	maxBytes := int64(env.Int("CAVE_MAX_REQUEST_BYTES", 100<<20))
++	if maxBytes <= 0 || maxBytes == 1<<63-1 {
++		maxBytes = 100 << 20
++	}
++	maxTransformBytes := int64(env.Int("CAVE_MAX_TRANSFORM_BYTES", 32<<20))
++	if maxTransformBytes <= 0 {
++		maxTransformBytes = 32 << 20
++	}
+ 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBytes+1))
+ 	_ = r.Body.Close()
+ 	if err != nil {
+@@ -123,9 +132,23 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 	if int64(len(body)) > maxBytes {
++		if s.logger != nil {
++			s.logger.Warn("request exceeds hard upload limit", "event", "request_rejected",
++				"reason", "request_size", "request_id", requestID,
++				"request_bytes_seen", len(body), "request_limit_bytes", maxBytes)
++		}
+ 		httpx.Error(w, r, http.StatusRequestEntityTooLarge, "cave_request_too_large", "Request body exceeds the proxy limit.")
+ 		return
+ 	}
++	sizeBypass := int64(len(body)) > maxTransformBytes
++	if sizeBypass {
++		w.Header().Set("x-cave-bypass", "request_size")
++		if s.logger != nil {
++			s.logger.Info("request exceeds transform budget; skipping optimization", "event", "request_bypass",
++				"reason", "request_size", "request_id", requestID, "request_bytes", len(body),
++				"transform_limit_bytes", maxTransformBytes, "request_limit_bytes", maxBytes)
++		}
++	}
+ 	body, correlatedSessionID, _ := nativeruntime.StripSessionMarkers(body, s.sessionMarkerKey)
+ 	if strings.HasPrefix(labelOrDefault(rc.Label, "local"), "trial:") {
+ 		if payloads, ok := s.sink.(PayloadSink); ok {
+@@ -135,7 +158,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
+ 	rawHash := sha256.Sum256(body)
+ 	// Decide after reading: standalone clients prove recovery with their request's
+ 	// namespaced caveman retrieve tool; wrap may prove it out of band.
+-	nonPAYGLiveZone := (authMode == AuthModeSubscription || authMode == AuthModeOAuth) && s.liveZoneCompressionAllowed(adapter, body)
++	nonPAYGLiveZone := !sizeBypass && (authMode == AuthModeSubscription || authMode == AuthModeOAuth) && s.liveZoneCompressionAllowed(adapter, body)
+ 	subscriptionPassthrough := authMode == AuthModeSubscription && !nonPAYGLiveZone
+ 	evidence := requestEvidenceFromHeaders(r.Header)
+ 	evidence.originalBody = body
+@@ -186,7 +209,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
+ 	compressionEligible := false
+ 	effectiveRuntimeMode := rc.RuntimeMode
+ 	reqContentEncoding := strings.TrimSpace(r.Header.Get("Content-Encoding"))
+-	if strings.TrimSpace(r.Header.Get("x-cave-transforms")) == "caveman.pass-through.v1" ||
++	if sizeBypass || strings.TrimSpace(r.Header.Get("x-cave-transforms")) == "caveman.pass-through.v1" ||
+ 		(reqContentEncoding != "" && !strings.EqualFold(reqContentEncoding, "identity")) {
+ 		// Framework callers use this request-wide opt-out when their result contract
+ 		// cannot observe or recover transformed bytes. It suppresses compression,
+@@ -208,7 +231,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
+ 		// ApplyResolvedPricingRoute below. `estimate` is written by exactly one
+ 		// goroutine and read only after estimateWG.Wait() (which establishes the
+ 		// happens-before), so every record() consumer sees a fully-computed value.
+-		if s.observeEstimate {
++		if s.observeEstimate && !sizeBypass {
+ 			estimateWG.Add(1)
+ 			go func(m providers.RequestMetadata) {
+ 				defer estimateWG.Done()
+@@ -341,7 +364,11 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	transformedHash := sha256.Sum256(transform.Body)
+ 	evidence.acceptedBody = transform.Body
+-	providerCachePrefixSHA256, providerCacheComponentSHA256, cacheBoundaryKnown := providerPrefixEvidence(adapter, transform.Body, meta)
++	var providerCachePrefixSHA256, providerCacheComponentSHA256 string
++	var cacheBoundaryKnown bool
++	if !sizeBypass {
++		providerCachePrefixSHA256, providerCacheComponentSHA256, cacheBoundaryKnown = providerPrefixEvidence(adapter, transform.Body, meta)
++	}
+ 
+ 	// Observe-only prefix-monotonicity check (issue #133): compare this request's
+ 	// frozen-prefix component hashes against the previous request in the same
+diff --git a/proxy/internal/gateway/request_size_test.go b/proxy/internal/gateway/request_size_test.go
+new file mode 100644
+index 0000000..3fe07fc
+--- /dev/null
++++ b/proxy/internal/gateway/request_size_test.go
+@@ -0,0 +1,167 @@
++package gateway
++
++import (
++	"bytes"
++	"context"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strconv"
++	"strings"
++	"testing"
++
++	"github.com/JuliusBrussee/caveman/proxy/providers"
++	"github.com/JuliusBrussee/caveman/proxy/providers/openai"
++)
++
++type requestSizeNativeAdapter struct {
++	providers.Adapter
++	calls *int
++}
++
++func (a requestSizeNativeAdapter) ApplyProviderNativeTransforms(context.Context, providers.BodyReader, providers.RequestMetadata, providers.TransformPolicy) (providers.TransformResult, error) {
++	*a.calls++
++	return providers.TransformResult{Body: []byte(`{"model":"gpt-5.6","input":"transformed"}`), OptimizerIDs: []string{"native.test"}}, nil
++}
++
++func TestRequestSizeBypassSkipsEveryTransformPath(t *testing.T) {
++	body := openAIPixelBody()
++	for _, mode := range []string{"compress", "pixel", "cache", "record"} {
++		for _, unknownLength := range []bool{false, true} {
++			t.Run(mode+"/unknown_length="+strconv.FormatBool(unknownLength), func(t *testing.T) {
++				t.Setenv("CAVE_MAX_TRANSFORM_BYTES", "128")
++				t.Setenv("CAVE_MAX_REQUEST_BYTES", strconv.Itoa(len(body)+1))
++				comp := &estimateStub{before: 100, after: 1}
++				nativeCalls, upstreamCalls := 0, 0
++				var adapter providers.Adapter = openai.New("https://upstream.test")
++				if mode == "cache" {
++					adapter = requestSizeNativeAdapter{Adapter: adapter, calls: &nativeCalls}
++				}
++				sink := &captureSink{}
++				srv := New(Config{
++					Adapters: []providers.Adapter{adapter},
++					Auth:     stubAuth{rc: RequestContext{Label: "local", RuntimeMode: mode}},
++					Creds:    stubCreds{key: "sk-byok"}, Sink: sink, Compressor: comp,
++					ObserveEstimate: true, RecoveryViaMCP: true,
++					HTTPClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
++						upstreamCalls++
++						got, err := io.ReadAll(r.Body)
++						if err != nil || !bytes.Equal(got, body) {
++							t.Errorf("size bypass changed original bytes: read error=%v", err)
++						}
++						if r.URL.Path != "/v1/chat/completions" || r.Header.Get("Authorization") != "Bearer sk-byok" {
++							t.Errorf("size bypass changed common routing/credentials: path=%q auth=%q", r.URL.Path, r.Header.Get("Authorization"))
++						}
++						return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(openAIPixelResponse()))}, nil
++					})},
++				})
++				request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
++				if unknownLength {
++					request.ContentLength = -1
++				}
++				recorder := httptest.NewRecorder()
++				srv.Handler().ServeHTTP(recorder, request)
++				if recorder.Code != http.StatusOK || recorder.Header().Get("x-cave-bypass") != "request_size" {
++					t.Fatalf("status=%d bypass=%q, want 200/request_size", recorder.Code, recorder.Header().Get("x-cave-bypass"))
++				}
++				if upstreamCalls != 1 || comp.compressCalls != 0 || comp.estimateCalls != 0 || comp.storeCalls != 0 || nativeCalls != 0 {
++					t.Errorf("bypass ran transforms: upstream=%d compression=%d estimate=%d store=%d native=%d", upstreamCalls, comp.compressCalls, comp.estimateCalls, comp.storeCalls, nativeCalls)
++				}
++				row := sink.last(t)
++				if row.RawRequestSHA256 != row.TransformedRequestSHA256 || len(row.OptimizationIDs) != 0 || row.RecoveryHandle != "" {
++					t.Errorf("bypass claimed transformed bytes or recovery: %+v", row)
++				}
++			})
++		}
++	}
++}
++
++func TestRequestSizeBypassBoundariesAndNextRequest(t *testing.T) {
++	t.Setenv("CAVE_MAX_TRANSFORM_BYTES", "128")
++	t.Setenv("CAVE_MAX_REQUEST_BYTES", "200")
++	nativeCalls, upstreamCalls := 0, 0
++	var forwarded []byte
++	srv := New(Config{
++		Adapters: []providers.Adapter{requestSizeNativeAdapter{Adapter: openai.New("https://upstream.test"), calls: &nativeCalls}},
++		Auth:     stubAuth{rc: RequestContext{RuntimeMode: "cache"}}, Creds: stubCreds{key: "sk-test"},
++		HTTPClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
++			upstreamCalls++
++			forwarded, _ = io.ReadAll(r.Body)
++			return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
++		})},
++	})
++	for _, tc := range []struct {
++		size, status int
++		bypass       bool
++	}{
++		{128, 200, false}, {129, 200, true}, {128, 200, false}, {200, 200, true}, {201, 413, false},
++	} {
++		body := `{"model":"gpt-5.6","input":"original"}`
++		body += strings.Repeat(" ", tc.size-len(body))
++		rec := httptest.NewRecorder()
++		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
++		req.ContentLength = -1 // Enforce limits using bytes read, including chunked uploads.
++		srv.Handler().ServeHTTP(rec, req)
++		if rec.Code != tc.status || (rec.Header().Get("x-cave-bypass") == "request_size") != tc.bypass {
++			t.Fatalf("size=%d: status=%d bypass=%q", tc.size, rec.Code, rec.Header().Get("x-cave-bypass"))
++		}
++		if tc.bypass && string(forwarded) != body {
++			t.Fatalf("size=%d: bypass changed payload", tc.size)
++		}
++	}
++	if upstreamCalls != 4 || nativeCalls != 2 {
++		t.Fatalf("upstream=%d native=%d: hard rejection must not forward, and next small request must optimize", upstreamCalls, nativeCalls)
++	}
++}
++
++func TestRequestSizeBypassPreservesUpstreamResponseWithoutReplay(t *testing.T) {
++	t.Setenv("CAVE_MAX_TRANSFORM_BYTES", "1")
++	for _, tc := range []struct {
++		status                int
++		contentType, response string
++	}{
++		{200, "text/event-stream", "data: {\"type\":\"response.completed\"}\n\n"},
++		{413, "application/json", `{"error":"upstream limit"}`},
++	} {
++		calls := 0
++		srv := New(Config{
++			Adapters: []providers.Adapter{openai.New("https://upstream.test")},
++			Auth:     stubAuth{rc: RequestContext{RuntimeMode: "compress"}}, Creds: stubCreds{},
++			HTTPClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
++				calls++
++				return &http.Response{StatusCode: tc.status, Header: http.Header{"Content-Type": {tc.contentType}}, Body: io.NopCloser(strings.NewReader(tc.response))}, nil
++			})},
++		})
++		rec := httptest.NewRecorder()
++		srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.6","input":"hello"}`)))
++		if calls != 1 || rec.Code != tc.status || rec.Body.String() != tc.response {
++			t.Fatalf("upstream response changed/replayed: calls=%d status=%d body=%q", calls, rec.Code, rec.Body.String())
++		}
++	}
++}
++
++func TestRequestSizeInvalidLimitsKeepFiniteDefaults(t *testing.T) {
++	for _, value := range []string{"", "0", "-1", "invalid", "9223372036854775807"} {
++		t.Run(value, func(t *testing.T) {
++			t.Setenv("CAVE_MAX_REQUEST_BYTES", value)
++			t.Setenv("CAVE_MAX_TRANSFORM_BYTES", value)
++			const body = `{"model":"gpt-5.6","input":"hello"}`
++			srv := New(Config{
++				Adapters: []providers.Adapter{openai.New("https://upstream.test")},
++				Auth:     stubAuth{rc: RequestContext{RuntimeMode: "record"}}, Creds: stubCreds{},
++				HTTPClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
++					got, _ := io.ReadAll(r.Body)
++					if string(got) != body {
++						t.Errorf("invalid limit truncated request: %q", got)
++					}
++					return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
++				})},
++			})
++			rec := httptest.NewRecorder()
++			srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
++			if rec.Code != 200 || rec.Header().Get("x-cave-bypass") != "" {
++				t.Fatalf("invalid limit rejected/bypassed small request: status=%d", rec.Code)
++			}
++		})
++	}
++}
+diff --git a/proxy/internal/gateway/stats_accounting.go b/proxy/internal/gateway/stats_accounting.go
+index 98bf7e9..47e6720 100644
+--- a/proxy/internal/gateway/stats_accounting.go
++++ b/proxy/internal/gateway/stats_accounting.go
+@@ -17,7 +17,7 @@ import (
+ 
+ const requestTokenBasis = "estimated_request_json_o200k_v1"
+ 
+-// Bound post-response accounting work independently of the 32 MiB proxy upload
++// Bound post-response accounting work independently of the proxy upload
+ // limit. Larger requests still flow normally and retain provider usage/pricing.
+ const requestAccountingMaxBytes = 4 << 20
+ 
