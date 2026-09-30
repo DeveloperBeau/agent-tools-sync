@@ -15,6 +15,7 @@
 # thin, side-effecting orchestration layer built on top.
 
 HEADROOM_MANIFEST="${HEADROOM_MANIFEST:-$HOME/.headroom/deploy/default/manifest.json}"
+HEADROOM_FORK_SOURCE='headroom-ai[all] @ git+https://github.com/DeveloperBeau/headroom.git@c22eb177c1623ccab05205d4c5e73213e97ce369'
 
 # headroom_profile_exists STATUS_TEXT — 0 if `install status` returned a real
 # profile block, 1 if it returned the "no such profile" error.
@@ -117,14 +118,31 @@ headroom_mcp_registered() {
 }
 
 install_headroom() {
-  if ! have headroom; then
-    if have uv; then run uv tool install --python 3.13 "headroom-ai[all]"
-    elif have pipx; then run pipx install "headroom-ai[all]"
-    else run pip3 install --user "headroom-ai[all]"
-    fi
+  if headroom_has_route_health; then
+    ok "diagnostic Headroom installed ($(headroom --version 2>/dev/null))"
+  elif have uv; then
+    run uv tool install --force --python 3.13 "$HEADROOM_FORK_SOURCE"
+  elif have pipx; then
+    run pipx install --force "$HEADROOM_FORK_SOURCE"
   else
-    ok "installed ($(headroom --version 2>/dev/null))"
+    run pip3 install --user --force-reinstall "$HEADROOM_FORK_SOURCE"
   fi
+}
+
+headroom_has_route_health() {
+  local script shebang interpreter
+  script="$(command -v headroom)" || return 1
+  IFS= read -r shebang < "$script" || return 1
+  case "$shebang" in
+    '#!'*) interpreter="${shebang#\#!}" ;;
+    *) return 1 ;;
+  esac
+  "$interpreter" -c '
+from headroom.proxy.route_health import RouteHealth
+import importlib.metadata, json, sys
+source = json.loads(importlib.metadata.distribution("headroom-ai").read_text("direct_url.json") or "{}")
+raise SystemExit(source.get("vcs_info", {}).get("commit_id") != sys.argv[1])
+' "${HEADROOM_FORK_SOURCE##*@}" >/dev/null 2>&1
 }
 
 # headroom_fix_rc_file RC_PATH — strips leaked ANTHROPIC_BASE_URL /
@@ -287,26 +305,13 @@ headroom_stop_proxy() {
 
 setup_headroom() {
   section "headroom"
-  local previous_version="" current_version
-  have headroom && previous_version="$(headroom --version 2>/dev/null)"
+  local had_route_health=false
+  headroom_has_route_health && had_route_health=true
   install_headroom
   have headroom || { warn "headroom not on PATH after install — skipping rest"; return; }
-
-  # Bounded: this hits the network, and headroom has been observed to hang
-  # here for 5+ minutes with nothing but Ctrl-C to escape.
-  # -y: `headroom update` prompts "Proceed with the upgrade? [Y/n]" when a
-  # newer release exists; non-interactive stdin here can't answer it, so
-  # without -y this always hangs to the with_timeout bound and reports as
-  # a failed/timed-out check even when the real cause is a pending update.
-  if run with_timeout 30 headroom update -y >/dev/null 2>&1; then
-    ok "checked for updates"
-    current_version="$(headroom --version 2>/dev/null)"
-    if [ -n "$previous_version" ] && [ -n "$current_version" ] &&
-       [ "$previous_version" != "$current_version" ]; then
-      headroom_stop_proxy
-    fi
-  else
-    warn "update check failed or timed out"
+  headroom_has_route_health || { warn "diagnostic Headroom install failed — skipping rest"; return; }
+  if [ "$had_route_health" = false ]; then
+    headroom_stop_proxy
   fi
   headroom_fix_rc_file "$HOME/.zshrc"
   headroom_fix_rc_file "$HOME/.bashrc"

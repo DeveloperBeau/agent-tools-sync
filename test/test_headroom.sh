@@ -253,4 +253,32 @@ headroom_fix_codex_config "$tmp_codex2" >/dev/null
 assert_eq "fix_codex_config: file without the retired block is untouched" "$before_no_provider_block" "$(cat "$tmp_codex2")"
 rm -f "$tmp_codex2"
 
+# Setup must keep the pinned diagnostic build, never replace it via PyPI's
+# `headroom update`, and restart an older live proxy after first install.
+headroom_pin_setup_calls() (
+  local installed=false calls="" HEADROOM_PORT=8788
+  have() { return 0; }
+  headroom_has_route_health() { [ "$installed" = true ]; }
+  install_headroom() { calls="$calls install"; installed=true; }
+  headroom_stop_proxy() { calls="$calls stop"; }
+  headroom_ensure_proxy() { calls="$calls ensure"; }
+  headroom() {
+    if [ "$1" = --version ]; then echo 0.39.1
+    elif [ "$1" = update ]; then calls="$calls update"
+    fi
+  }
+  with_timeout() { shift; "$@"; }
+  run() { "$@"; }
+  headroom_fix_rc_file() { :; }
+  headroom_fix_codex_config() { :; }
+  headroom_fix_codex_hooks() { :; }
+  headroom_remove_legacy_profile() { :; }
+  headroom_ensure_claude_mcp() { :; }
+  headroom_ensure_codex_mcp() { :; }
+  setup_headroom >/dev/null
+  printf '%s' "$calls"
+)
+assert_eq "setup_headroom: pinned fork install restarts old proxy without PyPI update" \
+  " install stop ensure" "$(headroom_pin_setup_calls)"
+
 report
