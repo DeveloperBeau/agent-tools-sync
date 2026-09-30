@@ -25,6 +25,22 @@ Provider recovery remains unverified until the next real request completes.
 This is incident capture and bounded recovery, not a proven root-cause fix.
 Caveman or provider failures may persist after restarting Headroom.
 
+## Keep upstream updates
+
+ATS setup retains a bounded `headroom update --check` call. It reports upstream
+PyPI releases but never upgrades over the pinned fork. The same check can run
+directly without invoking ATS:
+
+```sh
+headroom update --check
+```
+
+When a release is available, merge its upstream tag into
+`feature/route-health-stream-recovery`, resolve conflicts while preserving route
+health and upstream timing instrumentation, run focused tests, and push the fork.
+Update `HEADROOM_FORK_SOURCE` to the resulting full commit before deployment.
+Do not use `headroom update -y` or upgrade directly from PyPI while using the fork.
+
 ## Standalone installation
 
 Install the Headroom revision pinned by `HEADROOM_FORK_SOURCE` in `lib/headroom.sh`,

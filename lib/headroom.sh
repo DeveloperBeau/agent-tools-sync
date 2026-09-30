@@ -310,6 +310,10 @@ setup_headroom() {
   install_headroom
   have headroom || { warn "headroom not on PATH after install — skipping rest"; return; }
   headroom_has_route_health || { warn "diagnostic Headroom install failed — skipping rest"; return; }
+  # Report upstream releases without replacing the fork and losing diagnostics.
+  if ! run with_timeout 30 headroom update --check; then
+    warn "upstream Headroom update check failed or timed out"
+  fi
   if [ "$had_route_health" = false ]; then
     headroom_stop_proxy
   fi
