@@ -22,7 +22,7 @@ ROUTE_URL = "http://127.0.0.1:8788/health/routes"
 READY_URL = "http://127.0.0.1:8788/readyz"
 STATE_PATH = HEADROOM / "watchdog-state.json"
 INCIDENTS = HEADROOM / "incidents"
-LABEL = "com.agent-tools-sync.proxy-watchdog"
+LABEL = "au.com.beauayres.agent-tools-sync.proxy-watchdog"
 POLL_SECONDS = 10
 COOLDOWN_SECONDS = 30 * 60
 SAMPLE_SECONDS = 60
@@ -175,11 +175,8 @@ def _managed_headroom_loaded() -> bool:
         return False
 
 
-def recover(route: str, routes: dict, state: dict, now: float) -> None:
-    # A deliberately unloaded service must stay stopped. KeepAlive handles
-    # crashes; a loaded but unresponsive service still needs recovery.
-    if not _managed_headroom_loaded():
-        return
+def _capture_incident(route: str, routes: dict, state: dict) -> tuple[Path, dict]:
+    INCIDENTS.mkdir(parents=True, exist_ok=True)
     incident = {
         "time": datetime.now(timezone.utc).isoformat(),
         "route": route,
@@ -194,8 +191,25 @@ def recover(route: str, routes: dict, state: dict, now: float) -> None:
         "caveman_events": _safe_caveman_tail(),
         "memory_samples": state.get("memory_samples", []),
     }
-    incident_path = INCIDENTS / f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{route}.json"
+    incident_path = INCIDENTS / f"{datetime.now(timezone.utc):%Y%m%dT%H%M%S%fZ}-{route}.json"
     _save_json(incident_path, incident)
+    return incident_path, incident
+
+
+def capture() -> None:
+    """Save evidence on demand, including failures before reaching Headroom."""
+    os.umask(0o077)
+    state = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {}
+    path, _ = _capture_incident("manual", _snapshot(ROUTE_URL), state)
+    print(f"Captured proxy evidence: {path}")
+
+
+def recover(route: str, routes: dict, state: dict, now: float) -> None:
+    # A deliberately unloaded service must stay stopped. KeepAlive handles
+    # crashes; a loaded but unresponsive service still needs recovery.
+    if not _managed_headroom_loaded():
+        return
+    incident_path, incident = _capture_incident(route, routes, state)
     state.update(last_attempt=now, incident=str(incident_path))
     _save_json(STATE_PATH, state)
     incident["restart"] = _restart_headroom()
@@ -300,5 +314,7 @@ if __name__ == "__main__":
         watch()
     elif sys.argv[1:] == ["install"]:
         install()
+    elif sys.argv[1:] == ["capture"]:
+        capture()
     else:
-        raise SystemExit("usage: proxy_watchdog.py [watch|install]")
+        raise SystemExit("usage: proxy_watchdog.py [watch|install|capture]")

@@ -1,5 +1,7 @@
 import importlib.util
 import pathlib
+import json
+import plistlib
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -86,6 +88,41 @@ class RecoveryDecisionTests(unittest.TestCase):
             watchdog.recover("headroom_health_endpoint", {}, {}, 10_000)
         restart.assert_not_called()
         save.assert_not_called()
+
+    def test_manual_capture_does_not_restart_or_change_watchdog_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            state = root / "state.json"
+            state.write_text('{"memory_samples": []}')
+            before = state.read_bytes()
+            with patch.multiple(watchdog, STATE_PATH=state, INCIDENTS=root / "incidents"), \
+                 patch.object(watchdog, "_snapshot", return_value={"probe_error": "unreachable"}), \
+                 patch.object(watchdog, "_listener_memory", return_value=None), \
+                 patch.object(watchdog, "_safe_log_tail", return_value=[]), \
+                 patch.object(watchdog, "_safe_caveman_tail", return_value=[]), \
+                 patch.object(watchdog.os, "umask"), \
+                 patch.object(watchdog, "_restart_headroom") as restart:
+                watchdog.capture()
+            incident = json.loads(next((root / "incidents").glob("*.json")).read_text())
+            self.assertEqual(incident["route"], "manual")
+            self.assertEqual(state.read_bytes(), before)
+            restart.assert_not_called()
+
+    def test_install_uses_personal_launchagent_identifier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            agents = root / "Library/LaunchAgents"
+            agents.mkdir(parents=True)
+            with patch.object(watchdog.Path, "home", return_value=root), \
+                 patch.object(watchdog, "HEADROOM", root / ".headroom"), \
+                 patch.object(watchdog.os, "umask"), \
+                 patch.object(watchdog.subprocess, "run") as run:
+                watchdog.install()
+            with (agents / f"{watchdog.LABEL}.plist").open("rb") as source:
+                self.assertEqual(plistlib.load(source)["Label"], "au.com.beauayres.agent-tools-sync.proxy-watchdog")
+            calls = [call.args[0] for call in run.call_args_list]
+            self.assertTrue(calls[0][-1].endswith("/au.com.beauayres.agent-tools-sync.proxy-watchdog"))
+            self.assertEqual(calls[-1][1], "bootstrap")
 
     def test_three_unresponsive_health_probes_trigger_recovery(self):
         with tempfile.TemporaryDirectory() as directory:

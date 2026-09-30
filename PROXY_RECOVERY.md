@@ -55,18 +55,25 @@ python3 /absolute/path/to/agent-tools-sync/lib/proxy_watchdog.py install
 ```
 
 The watchdog installs a user LaunchAgent named
-`com.agent-tools-sync.proxy-watchdog`. Installation and operation do not invoke
+`au.com.beauayres.agent-tools-sync.proxy-watchdog`. Installation and operation do not invoke
 ATS. Keep the source checkout at its installed path. Restart can interrupt active
 requests. Existing deployment configuration and agent routing stay in place.
 
 ## Inspect the next failure
+
+If the client fails while observed Headroom routes look healthy, capture a report
+manually. This also captures failures earlier in the chain without restarting:
+
+```sh
+python3 /absolute/path/to/agent-tools-sync/lib/proxy_watchdog.py capture
+```
 
 ```sh
 curl -sS http://127.0.0.1:8788/health/routes
 cat ~/.headroom/watchdog-state.json
 ls -lt ~/.headroom/incidents/
 tail -n 20 ~/.headroom/watchdog.stdout.log ~/.headroom/watchdog.stderr.log
-launchctl print gui/$(id -u)/com.agent-tools-sync.proxy-watchdog
+launchctl print gui/$(id -u)/au.com.beauayres.agent-tools-sync.proxy-watchdog
 ```
 
 Compare upstream chunk timing with downstream outcomes and Caveman errors.
@@ -80,8 +87,8 @@ the other route.
 Disable the watchdog before replacing the fork:
 
 ```sh
-launchctl bootout gui/$(id -u)/com.agent-tools-sync.proxy-watchdog
-rm ~/Library/LaunchAgents/com.agent-tools-sync.proxy-watchdog.plist
+launchctl bootout gui/$(id -u)/au.com.beauayres.agent-tools-sync.proxy-watchdog
+rm ~/Library/LaunchAgents/au.com.beauayres.agent-tools-sync.proxy-watchdog.plist
 uv tool install --force --python 3.13 'headroom-ai[all]==0.39.1'
 headroom install restart --profile default
 ```
