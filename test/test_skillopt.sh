@@ -23,16 +23,37 @@ skillopt_fixture() {
   printf '{"name":"skillopt-sleep"}\n' >"$source/plugins/claude-code/.claude-plugin/marketplace.json"
   "$SKILLOPT_TEST_GIT" -C "$source" add .
   "$SKILLOPT_TEST_GIT" -C "$source" commit -qm initial
+  "$SKILLOPT_TEST_GIT" clone -q "$source" "$SKILLOPT_TEST_ROOT/fork"
+  "$SKILLOPT_TEST_GIT" -C "$SKILLOPT_TEST_ROOT/fork" config user.email tests@example.invalid
+  "$SKILLOPT_TEST_GIT" -C "$SKILLOPT_TEST_ROOT/fork" config user.name Tests
+  printf 'fork guidance discovery\n' >"$SKILLOPT_TEST_ROOT/fork/fork.txt"
+  "$SKILLOPT_TEST_GIT" -C "$SKILLOPT_TEST_ROOT/fork" add .
+  "$SKILLOPT_TEST_GIT" -C "$SKILLOPT_TEST_ROOT/fork" commit -qm fork
   cat >"$SKILLOPT_TEST_ROOT/bin/git" <<'GIT'
 #!/usr/bin/env bash
 printf 'git %s\n' "$*" >>"$SKILLOPT_TEST_ROOT/calls"
 if [ "$1" = clone ]; then
   [ "${SKILLOPT_TEST_CLONE_FAIL:-0}" = 0 ] || exit 1
-  "$SKILLOPT_TEST_GIT" clone --quiet --branch main "$SKILLOPT_TEST_ROOT/upstream" "${@: -1}" || exit
-  "$SKILLOPT_TEST_GIT" -C "${@: -1}" remote set-url origin https://github.com/microsoft/SkillOpt.git
+  origin="${@: -2:1}"
+  case "$origin" in
+    *microsoft/SkillOpt*) source="$SKILLOPT_TEST_ROOT/upstream" ;;
+    *DeveloperBeau/SkillOpt*) source="$SKILLOPT_TEST_ROOT/fork" ;;
+    *) exit 1 ;;
+  esac
+  "$SKILLOPT_TEST_GIT" clone --quiet --branch main "$source" "${@: -1}" || exit
+  "$SKILLOPT_TEST_GIT" -C "${@: -1}" remote set-url origin "$origin"
 elif [ "${3:-}" = fetch ]; then
   [ "${SKILLOPT_TEST_FETCH_FAIL:-0}" = 0 ] || exit 1
-  "$SKILLOPT_TEST_GIT" -C "$2" fetch --quiet "$SKILLOPT_TEST_ROOT/upstream" main:refs/remotes/origin/main
+  origin="$5"
+  [ "$origin" != origin ] || origin="$("$SKILLOPT_TEST_GIT" -C "$2" remote get-url origin)"
+  case "$origin" in
+    *microsoft/SkillOpt*) source="$SKILLOPT_TEST_ROOT/upstream" ;;
+    *DeveloperBeau/SkillOpt*) source="$SKILLOPT_TEST_ROOT/fork" ;;
+    *) exit 1 ;;
+  esac
+  ref=main
+  [ "$5" != origin ] || ref=main:refs/remotes/origin/main
+  "$SKILLOPT_TEST_GIT" -C "$2" fetch --quiet "$source" "$ref"
 else
   exec "$SKILLOPT_TEST_GIT" "$@"
 fi
@@ -80,6 +101,7 @@ skillopt_initial_and_rerun() (
   skillopt_fixture
   setup_skillopt >/dev/null || return 1
   local skill="$HOME/.agents/skills/skillopt-sleep/SKILL.md"
+  [ -f "$HOME/.local/share/skillopt/fork.txt" ] || return 1
   [ -s "$skill" ] || return 1
   grep -q 'claude plugin install skillopt-sleep@skillopt-sleep --scope user' "$SKILLOPT_TEST_ROOT/calls" || return 1
   setup_skillopt >/dev/null || return 1
@@ -146,37 +168,102 @@ check 'SkillOpt clone failure stays nonfatal' skillopt_nonfatal_failure SKILLOPT
 check 'SkillOpt engine failure stays nonfatal' skillopt_nonfatal_failure SKILLOPT_TEST_UV_FAIL
 check 'SkillOpt respects marketplace add failures while still installing Codex' skillopt_nonfatal_failure SKILLOPT_TEST_CLAUDE_FAIL
 
+skillopt_microsoft_checkout() {
+  local repo="$HOME/.local/share/skillopt"
+  mkdir -p "$(dirname "$repo")"
+  "$SKILLOPT_TEST_GIT" clone -q "$SKILLOPT_TEST_ROOT/upstream" "$repo"
+  "$SKILLOPT_TEST_GIT" -C "$repo" remote set-url origin "${1:-https://github.com/microsoft/SkillOpt.git}"
+}
+
+skillopt_migrates_microsoft() (
+  skillopt_fixture
+  skillopt_microsoft_checkout "$1" || return 1
+  local repo="$HOME/.local/share/skillopt"
+  if [ "${2:-}" = upstream ]; then
+    git -C "$repo" remote add upstream git@github.com:microsoft/SkillOpt.git || return 1
+  fi
+  setup_skillopt >/dev/null || return 1
+  [ "$(git -C "$repo" remote get-url origin)" = https://github.com/DeveloperBeau/SkillOpt.git ] || return 1
+  [ -f "$repo/fork.txt" ] || return 1
+  [ "$(git -C "$repo" rev-parse HEAD)" = "$(git -C "$repo" rev-parse origin/main)" ] || return 1
+  [ "$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}')" = origin/main ] || return 1
+  case "$(git -C "$repo" remote get-url upstream)" in
+    https://github.com/microsoft/SkillOpt.git|git@github.com:microsoft/SkillOpt.git) ;;
+    *) return 1 ;;
+  esac
+  : >"$SKILLOPT_TEST_ROOT/calls"
+  setup_skillopt >/dev/null || return 1
+  ! grep -q '^git clone ' "$SKILLOPT_TEST_ROOT/calls"
+)
+check 'SkillOpt migrates clean Microsoft HTTPS checkouts' skillopt_migrates_microsoft https://github.com/microsoft/SkillOpt.git
+check 'SkillOpt migrates Microsoft SCP checkouts and retains matching upstream' skillopt_migrates_microsoft git@github.com:microsoft/SkillOpt.git upstream
+check 'SkillOpt migrates Microsoft SSH checkouts' skillopt_migrates_microsoft ssh://git@github.com/microsoft/SkillOpt
+
 skillopt_local_checkout_preserved() (
   skillopt_fixture
-  setup_skillopt >/dev/null || return 1
+  if [ "${2:-fork}" = microsoft ]; then
+    skillopt_microsoft_checkout || return 1
+  else
+    setup_skillopt >/dev/null || return 1
+  fi
   local repo="$HOME/.local/share/skillopt" before
   case "$1" in
     dirty) printf changed >"$repo/pyproject.toml" ;;
     unrelated) git -C "$repo" remote set-url origin https://example.invalid/unrelated.git ;;
+    branch) git -C "$repo" switch -q -c feature/local ;;
+    upstream) git -C "$repo" remote add upstream https://example.invalid/unrelated.git ;;
+    fetch) export SKILLOPT_TEST_FETCH_FAIL=1 ;;
+    fork-diverged)
+      "$SKILLOPT_TEST_GIT" -C "$SKILLOPT_TEST_ROOT/fork" checkout -q --orphan replacement
+      "$SKILLOPT_TEST_GIT" -C "$SKILLOPT_TEST_ROOT/fork" commit -qm unrelated
+      "$SKILLOPT_TEST_GIT" -C "$SKILLOPT_TEST_ROOT/fork" branch -M main ;;
     diverged)
       printf local >"$repo/pyproject.toml"
       git -C "$repo" -c user.name=Tests -c user.email=tests@example.invalid commit -qam local ;;
   esac
-  before="$(git -C "$repo" rev-parse HEAD):$(cat "$repo/pyproject.toml")"
+  before="$(git -C "$repo" rev-parse HEAD origin/main):$(git -C "$repo" branch --show-current):$(cat "$repo/pyproject.toml"):$(git -C "$repo" config --local --list)"
   : >"$SKILLOPT_TEST_ROOT/calls"
   setup_skillopt >"$HOME/output" || return 1
-  [ "$(git -C "$repo" rev-parse HEAD):$(cat "$repo/pyproject.toml")" = "$before" ] || return 1
-  grep -q preserved "$HOME/output" || return 1
+  [ "$(git -C "$repo" rev-parse HEAD origin/main):$(git -C "$repo" branch --show-current):$(cat "$repo/pyproject.toml"):$(git -C "$repo" config --local --list)" = "$before" ] || return 1
+  grep -Eq 'preserved|unavailable' "$HOME/output" || return 1
   ! grep -Eq '^uv |^claude ' "$SKILLOPT_TEST_ROOT/calls"
 )
 check 'SkillOpt preserves dirty checkouts' skillopt_local_checkout_preserved dirty
 check 'SkillOpt preserves unrelated checkouts' skillopt_local_checkout_preserved unrelated
 check 'SkillOpt preserves local commits' skillopt_local_checkout_preserved diverged
+check 'SkillOpt preserves local branches' skillopt_local_checkout_preserved branch
+check 'SkillOpt preserves dirty Microsoft checkouts' skillopt_local_checkout_preserved dirty microsoft
+check 'SkillOpt preserves Microsoft local commits' skillopt_local_checkout_preserved diverged microsoft
+check 'SkillOpt preserves Microsoft local branches' skillopt_local_checkout_preserved branch microsoft
+check 'SkillOpt preserves conflicting upstream remotes' skillopt_local_checkout_preserved upstream microsoft
+check 'SkillOpt keeps Microsoft remotes when fork fetch fails' skillopt_local_checkout_preserved fetch microsoft
+check 'SkillOpt refuses migration to a diverged fork' skillopt_local_checkout_preserved fork-diverged microsoft
 
 skillopt_fast_forwards() (
   skillopt_fixture
   setup_skillopt >/dev/null || return 1
-  printf upstream >"$SKILLOPT_TEST_ROOT/upstream/pyproject.toml"
-  "$SKILLOPT_TEST_GIT" -C "$SKILLOPT_TEST_ROOT/upstream" commit -qam update
+  printf upstream >"$SKILLOPT_TEST_ROOT/fork/pyproject.toml"
+  "$SKILLOPT_TEST_GIT" -C "$SKILLOPT_TEST_ROOT/fork" commit -qam update
   setup_skillopt >/dev/null || return 1
   [ "$(cat "$HOME/.local/share/skillopt/pyproject.toml")" = upstream ]
 )
 check 'SkillOpt fast-forwards upstream updates' skillopt_fast_forwards
+
+skillopt_fork_url() (
+  skillopt_fixture
+  setup_skillopt >/dev/null || return 1
+  local repo="$HOME/.local/share/skillopt"
+  git -C "$repo" remote set-url origin "$1" || return 1
+  printf fork-update >"$SKILLOPT_TEST_ROOT/fork/pyproject.toml"
+  "$SKILLOPT_TEST_GIT" -C "$SKILLOPT_TEST_ROOT/fork" commit -qam update
+  setup_skillopt >/dev/null || return 1
+  [ "$(cat "$repo/pyproject.toml")" = fork-update ] || return 1
+  [ "$(git -C "$repo" remote get-url origin)" = "$1" ] || return 1
+  ! git -C "$repo" remote get-url upstream >/dev/null 2>&1
+)
+check 'SkillOpt updates fork HTTPS checkouts without .git' skillopt_fork_url https://github.com/DeveloperBeau/SkillOpt
+check 'SkillOpt updates fork SCP checkouts' skillopt_fork_url git@github.com:DeveloperBeau/SkillOpt.git
+check 'SkillOpt updates fork SSH checkouts' skillopt_fork_url ssh://git@github.com/DeveloperBeau/SkillOpt.git
 
 skillopt_conflicting_marketplace() (
   skillopt_fixture

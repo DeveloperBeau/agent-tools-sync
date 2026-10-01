@@ -62,8 +62,12 @@ Optional standalone watchdog records separate Claude and ChatGPT Codex route hea
 
 ## SkillOpt
 
-ATS keeps a source checkout at `~/.local/share/skillopt` and installs its CLI with
-`uv tool`. Future syncs fast-forward the checkout and refresh the agent integrations.
+ATS installs the [DeveloperBeau fork of SkillOpt](https://github.com/DeveloperBeau/SkillOpt),
+which discovers agent guidance and prompts as optimization targets. It keeps a source
+checkout at `~/.local/share/skillopt` and installs its CLI with `uv tool`.
+Future syncs fast-forward the checkout and refresh the agent integrations.
+Clean Microsoft `main` checkouts migrate to the fork while retaining Microsoft as
+`upstream`; dirty, diverged, unrelated checkouts and conflicting remotes are preserved.
 Set `SKILLOPT_SLEEP_REPO` to use another checkout location. Local checkout changes
 are preserved. The Codex skill includes the checkout path so desktop sessions can
 find it without inheriting terminal environment variables.

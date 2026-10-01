@@ -3,19 +3,21 @@
 # Installation does not harvest sessions, run optimization, schedule, or adopt.
 
 skillopt_checkout() {
-  local repo="$1" origin root changes
+  local repo="$1" origin root changes upstream target migrate=no
+  local fork=https://github.com/DeveloperBeau/SkillOpt.git
   if [ ! -e "$repo" ]; then
     mkdir -p "$(dirname "$repo")" || return 1
     run with_timeout 120 env GIT_TERMINAL_PROMPT=0 git clone --quiet --branch main --single-branch \
-      https://github.com/microsoft/SkillOpt.git "$repo" || return 1
+      "$fork" "$repo" || return 1
   else
     root="$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" || {
       warn "SkillOpt path is not a checkout; preserved: $repo"; return 1;
     }
     [ "$root" = "$repo" ] || { warn "SkillOpt path belongs to another checkout; preserved"; return 1; }
     origin="$(git -C "$repo" remote get-url origin 2>/dev/null)" || return 1
-    case "$origin" in
-      https://github.com/microsoft/SkillOpt|https://github.com/microsoft/SkillOpt.git|git@github.com:microsoft/SkillOpt.git) ;;
+    case "${origin%.git}" in
+      https://github.com/microsoft/SkillOpt|git@github.com:microsoft/SkillOpt|ssh://git@github.com/microsoft/SkillOpt) migrate=yes ;;
+      https://github.com/DeveloperBeau/SkillOpt|git@github.com:DeveloperBeau/SkillOpt|ssh://git@github.com/DeveloperBeau/SkillOpt) ;;
       *) warn "SkillOpt checkout has another origin; preserved: $repo"; return 1 ;;
     esac
     changes="$(git -C "$repo" status --porcelain)" || return 1
@@ -23,12 +25,31 @@ skillopt_checkout() {
       warn "SkillOpt checkout has local changes or another branch; preserved: $repo"
       return 1
     fi
-    with_timeout 60 env GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch --quiet origin main || return 1
-    if ! git -C "$repo" merge-base --is-ancestor HEAD origin/main; then
+    target=origin/main
+    if [ "$migrate" = yes ]; then
+      upstream="$(git -C "$repo" remote get-url upstream 2>/dev/null)" || upstream=
+      case "${upstream%.git}" in
+        ''|https://github.com/microsoft/SkillOpt|git@github.com:microsoft/SkillOpt|ssh://git@github.com/microsoft/SkillOpt) ;;
+        *) warn "SkillOpt upstream has another source; preserved: $repo"; return 1 ;;
+      esac
+      # Fetch without changing origin or its tracking ref until migration is safe.
+      with_timeout 60 env GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch --quiet "$fork" main || return 1
+      target=FETCH_HEAD
+    else
+      with_timeout 60 env GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch --quiet origin main || return 1
+    fi
+    if ! git -C "$repo" merge-base --is-ancestor HEAD "$target"; then
       warn "SkillOpt checkout has local commits; preserved: $repo"
       return 1
     fi
-    run git -C "$repo" merge --ff-only --quiet origin/main || return 1
+    run git -C "$repo" merge --ff-only --quiet "$target" || return 1
+    if [ "$migrate" = yes ]; then
+      if [ -z "$upstream" ]; then
+        run git -C "$repo" remote add upstream https://github.com/microsoft/SkillOpt.git || return 1
+      fi
+      run git -C "$repo" remote set-url origin "$fork" || return 1
+      git -C "$repo" update-ref refs/remotes/origin/main HEAD || return 1
+    fi
   fi
   [ -f "$repo/pyproject.toml" ] && [ -f "$repo/plugins/run-sleep.sh" ] &&
     [ -f "$repo/plugins/codex/skills/skillopt-sleep/SKILL.md" ] &&

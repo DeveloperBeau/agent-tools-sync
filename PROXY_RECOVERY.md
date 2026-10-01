@@ -106,6 +106,12 @@ versions. Correlate Headroom request IDs, connection IDs, HTTP/2 stream IDs, and
 allowlisted upstream request IDs. IDs are scoped to a process; compare the PID
 before joining records across a restart. Diagnostic logs use
 `event=stream_diagnostic` and `event=proxy_loop_lag`.
+Connection records also retain inbound/outbound HTTP/2 frame counts, the last
+32 frame headers and numeric control fields, pending frame payload lengths,
+local/remote SETTINGS, DATA payload byte counts, and WINDOW_UPDATE increments.
+RST_STREAM and GOAWAY emit immediate `kind=h2_control` events. GOAWAY debug data
+is represented only by its length; request/response bodies and headers are skipped.
+WINDOW_UPDATE increments are activity counters, not exact flow-control windows.
 
 | Evidence | What it helps distinguish |
 | --- | --- |
@@ -119,9 +125,10 @@ before joining records across a restart. Diagnostic logs use
 | Growing RSS, high CPU, compression queues | Local resource pressure; correlate with timings before assigning cause. |
 | TCP retransmit/reset counters and socket states | Supporting network evidence; host-wide counters cannot identify one request. |
 
-Socket instrumentation measures decrypted transport read/write progress, not
-packet captures or HTTP/2 frame contents. It cannot establish why a remote peer
-stopped sending. No transport settings, retry policy, or restart criteria change
+Socket instrumentation measures decrypted transport read/write progress and
+bounded frame metadata, without packet captures or content payloads. It cannot
+establish a remote peer's internal reason for stopping or resetting a stream.
+No transport settings, retry policy, or restart criteria change
 with these diagnostics. Preserve reports before making further changes. A
 completed request on one route does not establish health of the other route.
 
