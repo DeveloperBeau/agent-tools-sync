@@ -48,6 +48,8 @@ source "$SCRIPT_DIR/lib/claude-mem.sh"
 source "$SCRIPT_DIR/lib/ship.sh"
 # shellcheck source=lib/skillopt.sh
 source "$SCRIPT_DIR/lib/skillopt.sh"
+# shellcheck source=lib/obsidian.sh
+source "$SCRIPT_DIR/lib/obsidian.sh"
 
 # caveman owns :8787 as the only proxy either agent's base URL points at.
 # headroom gets its own port and sits downstream of caveman in the chain
@@ -94,6 +96,7 @@ main() {
   setup_claude_mem
   setup_ship
   setup_skillopt
+  setup_obsidian
   section "done"
   echo "  caveman    → both agents' base URL, proxy on :8787, chains to headroom"
   echo "  headroom   → downstream compression hop on :$HEADROOM_PORT, on-demand MCP in Claude Code"
@@ -103,6 +106,7 @@ main() {
   echo "  claude-mem → cross-session memory plugin in both, worker daemon on its own port"
   echo "  ship       → optional private plugin in both agents"
   echo "  skillopt   → skill optimization CLI, Claude plugin, and Codex skill"
+  echo "  plans      → shared Obsidian vault, automatic Claude and Codex plan capture"
   echo "  Just run 'claude' or 'codex' as usual — nothing else to launch."
 }
 

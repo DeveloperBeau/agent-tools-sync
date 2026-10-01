@@ -12,6 +12,7 @@ Safe to re-run any time: every step checks current state first and only acts whe
 - **ponytail** — lazy-coding plugin in both Claude Code and Codex.
 - **Ship** — optional private plugin in both agents. ATS runs `ship-update` when installed, or attempts installation through authenticated GitHub CLI. Missing access leaves rest of sync working.
 - **SkillOpt** — [Microsoft's skill optimizer](https://github.com/microsoft/SkillOpt), with the SkillOpt-Sleep plugin for Claude Code and skill for Codex CLI/Desktop. Runs on demand and stages learned changes for review.
+- **Obsidian plans** — one shared Markdown vault for both agents, with automatic plan capture, project indexes, backlinks, and a properties table.
 
 Both tools are universal (each can wrap Claude Code, Codex, and a dozen other agents on its own) and are designed to stack rather than split one-per-agent — caveman's own README benchmarks headroom head-to-head as a direct alternative, and headroom's README documents running "Caveman, or any other MCP server" upstream of it. So the request path is `agent → caveman (:8787) → headroom (:8788) → real provider`, via a `compat` mount in `~/.caveman/caveman.yaml` (caveman has no override for its native wrap routes' upstream, only for named `compat` mounts) with `CAVE_SSRF_ALLOWLIST` opened for the loopback hop. `ats` patches `ANTHROPIC_BASE_URL` in `~/.claude/settings.json` and `model_providers.caveman.base_url` in `~/.codex/config.toml` to point at that mount instead of caveman's native `/w/claude` / `/chatgpt` routes. One side effect: `caveman status` reports both integrations as "degraded" afterward (it fingerprints the files it writes, and the patch changes them) — `ats` recognizes that as expected and won't retry or warn about it.
 
@@ -86,13 +87,53 @@ transcript-derived content to its provider. Review proposals before adoption.
 Scheduling and automatic adoption remain explicit choices in SkillOpt.
 
 For Codex learning runs, select `--source codex` and a Codex-visible
-`--target-skill-path .agents/skills/<name>/SKILL.md`. Upstream's shared memory
-target is `CLAUDE.md`; it does not write `AGENTS.md`.
+`--target-skill-path .agents/skills/<name>/SKILL.md`. The fork also supports
+`--target-document-path` for discovered guidance or stage prompts, and
+`--memory-path` for secondary guidance such as `CLAUDE.local.md` or `AGENTS.md`.
+
+## Shared plans and Obsidian
+
+Plans live only in `~/Developer/Personal/plans`, under one folder per project.
+Set `ATS_PLANS_VAULT` before sync to choose another shared directory. Existing
+notes and Obsidian settings are preserved; no community plugin is installed.
+Python 3.11 or newer is required for this integration.
+
+ATS installs managed instruction blocks and lifecycle hooks for both agents.
+Session hooks resolve the repository, including linked worktrees, and supply
+its canonical plan directory. Claude gets file access through
+`permissions.additionalDirectories`; Codex gets the vault in its workspace
+sandbox's `writable_roots`. Other permissions and hooks are preserved.
+
+Claude's default `~/.claude/plans` is linked to `Inbox/Claude` inside the vault.
+An existing native plans directory is moved intact when that Inbox is unused;
+conflicting directories or links are preserved and reported. The user-level
+`plansDirectory` override is removed because Claude rejects custom directories
+outside the project root. Project-level overrides still take precedence; remove
+those if native drafts continue landing in a code repository.
+
+Approved Claude `ExitPlanMode` output and Codex `<proposed_plan>` responses are
+saved automatically in the resolved project folder, with project, agent,
+session, creation time, type, and status properties. Native Claude drafts stay
+in the Inbox; approved snapshots are separate knowledge notes. Other answers
+are not saved as plans. Designs, specs, decisions, and reviews written through
+normal file tools follow the same canonical directory from the instructions.
+
+Open **Plans Home.md** in Obsidian for linked project indexes, or **Plans.base**
+for a table of note properties. Existing dated notes are indexed without being
+rewritten. Indexes refresh at session start and after plan/turn completion;
+ordinary code repositories receive no generated planning files. Handwritten
+indexes are preserved and use a separate generated index when names conflict.
+
+Start new Claude and Codex sessions to load the configuration. Codex may request
+its normal hook trust review. Hook failures surface a warning without blocking
+the conversation. Recovery copies of changed configuration files carry the
+`.ats-plans-backup` suffix.
 
 ## Testing
 
 ```sh
 bash test/run_tests.sh   # unit tests for every pure decision function
+python3 -m unittest discover -s test -p 'test_*.py' -q
 bash test/mutate.sh      # mutation testing against the test suite
 ```
 
