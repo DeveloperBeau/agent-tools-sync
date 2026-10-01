@@ -72,7 +72,7 @@ Install the Headroom revision pinned by `HEADROOM_FORK_SOURCE` in `lib/headroom.
 then restart Headroom directly:
 
 ```sh
-uv tool install --force --python 3.13 'headroom-ai[all] @ git+https://github.com/DeveloperBeau/headroom.git@313236de0c0c4f7ea93207d88a34bc761d2519d6'
+uv tool install --force --python 3.13 'headroom-ai[all] @ git+https://github.com/DeveloperBeau/headroom.git@7b1879a3fea42574b0d4b98eed25a24b29294867'
 headroom install restart --profile default
 python3 /absolute/path/to/agent-tools-sync/lib/proxy_watchdog.py install
 ```
@@ -189,5 +189,4 @@ headroom install restart --profile default
 ```
 
 This restores the previously installed Headroom release. Keep incident reports.
-The ATS feature branch pins the fork, so a future ATS invocation on that branch
-will install the diagnostic build again.
+ATS pins the diagnostic fork. A later full sync installs that build again.

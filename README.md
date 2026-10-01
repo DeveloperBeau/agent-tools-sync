@@ -1,20 +1,22 @@
 # agent-tools-sync
 
-Idempotent installer/updater for a local agent-efficiency toolkit — [headroom](https://github.com/headroomlabs-ai/headroom), [rtk](https://github.com/rtk-ai/rtk), [caveman](https://github.com/JuliusBrussee/caveman), and [ponytail](https://github.com/DietrichGebert/ponytail) — wired into both [Claude Code](https://claude.com/claude-code) and [Codex CLI](https://github.com/openai/codex).
+ATS installs and updates [headroom](https://github.com/headroomlabs-ai/headroom), [rtk](https://github.com/rtk-ai/rtk), [caveman](https://github.com/JuliusBrussee/caveman), and [ponytail](https://github.com/DietrichGebert/ponytail) for [Claude Code](https://claude.com/claude-code) and [Codex CLI](https://github.com/openai/codex).
 
-Safe to re-run any time: every step checks current state first and only acts when something is actually missing or out of date.
+Rerun ATS to check installed tools, apply updates, and refresh agent integrations.
 
 ## What it sets up
 
-- **caveman** — the only proxy either agent's base URL points at, on `:8787`. Owns both Claude Code's and Codex's native integration (hooks, skills, MCP recovery) and chains its own compression into headroom as the next hop.
-- **headroom** — a downstream compression hop behind caveman on `:8788` (not agent-facing), plus an on-demand MCP server in Claude Code.
-- **rtk** — shell-output compression hook in both Claude Code and Codex.
-- **ponytail** — lazy-coding plugin in both Claude Code and Codex.
-- **Ship** — optional private plugin in both agents. ATS runs `ship-update` when installed, or attempts installation through authenticated GitHub CLI. Missing access leaves rest of sync working.
-- **SkillOpt** — [Microsoft's skill optimizer](https://github.com/microsoft/SkillOpt), with the SkillOpt-Sleep plugin for Claude Code and skill for Codex CLI/Desktop. Runs on demand and stages learned changes for review.
-- **Obsidian plans** — one shared Markdown vault for both agents, with automatic plan capture, project indexes, backlinks, and a properties table.
+- **caveman:** proxy on `:8787`, plus agent hooks, skills, and MCP recovery. It forwards requests through headroom.
+- **headroom:** downstream compression proxy on `:8788`, plus an on-demand MCP server in Claude Code.
+- **rtk:** shell-output compression hook in both agents.
+- **ponytail:** lazy-coding plugin in both agents.
+- **Ship:** optional private plugin in both agents. ATS runs `ship-update` when installed or attempts installation through authenticated GitHub CLI. If access is unavailable, sync continues with the other tools.
+- **SkillOpt:** [Microsoft's skill optimizer](https://github.com/microsoft/SkillOpt), with the SkillOpt-Sleep plugin for Claude Code and skill for Codex CLI/Desktop. It runs on demand and stages learned changes for review.
+- **Obsidian plans:** optional shared Markdown vault with plan capture and project indexes. Setup is off by default; enable it with `ATS_OBSIDIAN_PLANS=1`.
 
-Both tools are universal (each can wrap Claude Code, Codex, and a dozen other agents on its own) and are designed to stack rather than split one-per-agent — caveman's own README benchmarks headroom head-to-head as a direct alternative, and headroom's README documents running "Caveman, or any other MCP server" upstream of it. So the request path is `agent → caveman (:8787) → headroom (:8788) → real provider`, via a `compat` mount in `~/.caveman/caveman.yaml` (caveman has no override for its native wrap routes' upstream, only for named `compat` mounts) with `CAVE_SSRF_ALLOWLIST` opened for the loopback hop. `ats` patches `ANTHROPIC_BASE_URL` in `~/.claude/settings.json` and `model_providers.caveman.base_url` in `~/.codex/config.toml` to point at that mount instead of caveman's native `/w/claude` / `/chatgpt` routes. One side effect: `caveman status` reports both integrations as "degraded" afterward (it fingerprints the files it writes, and the patch changes them) — `ats` recognizes that as expected and won't retry or warn about it.
+Requests follow `agent → caveman (:8787) → headroom (:8788) → provider`. ATS configures a `compat.headroom` mount in `~/.caveman/caveman.yaml` and permits the loopback hop through `CAVE_SSRF_ALLOWLIST`.
+
+ATS points Claude's `ANTHROPIC_BASE_URL` and Codex's `model_providers.caveman.base_url` at that mount. Caveman may then report its native integrations as "degraded" because ATS changed the files it fingerprints. ATS recognizes this routing configuration and leaves it in place.
 
 ## Install
 
@@ -41,12 +43,12 @@ Add an alias if you want the short form:
 echo 'alias ats="agent-tools-sync"' >> ~/.zshrc
 ```
 
-The whole directory is portable — copy it to another machine and symlink the entry point; `lib/*.sh` is resolved relative to the script's real location, not `$PWD`.
+You can copy the directory to another machine and symlink the entry point. The script resolves `lib/*.sh` from its own location.
 
 ## Usage
 
 ```sh
-ats            # install/update everything and wire up integrations
+ats            # install/update tools and enabled integrations
 ats kill       # stop both background proxies (caveman :8787, headroom :8788)
 ats start      # bring both proxies back up, without the full sync
 ```
@@ -61,7 +63,7 @@ The ATS-managed Caveman hook bridge removes unsupported context output from Code
 
 Optional standalone watchdog records separate Claude and ChatGPT Codex route health, captures incident evidence, and performs bounded Headroom recovery. It respects deliberate proxy stops and can capture reports manually. See [proxy recovery instructions](PROXY_RECOVERY.md) for installation, upstream fork maintenance, and rollback. ATS does not install or activate the watchdog automatically.
 
-`ats kill` is a hard stop — nothing auto-restarts headroom's proxy afterward (unlike caveman, which self-starts on the next agent session). Since caveman chains every request through headroom, both agents get connection-refused on the last hop until you run `ats start` or `ats`.
+`ats kill` stops Headroom until you run `ats start` or `ats`. Caveman can self-start on the next agent session, but requests through the chain fail while Headroom is stopped.
 
 ## SkillOpt
 
@@ -95,12 +97,23 @@ For Codex learning runs, select `--source codex` and a Codex-visible
 
 ## Shared plans and Obsidian
 
-Plans live only in `~/Developer/Personal/plans`, under one folder per project.
-Set `ATS_PLANS_VAULT` before sync to choose another shared directory. Existing
-notes and Obsidian settings are preserved; no community plugin is installed.
-Python 3.11 or newer is required for this integration.
+Setup is opt-in. To enable it for one sync:
 
-ATS installs managed instruction blocks and lifecycle hooks for both agents.
+```sh
+ATS_OBSIDIAN_PLANS=1 ats
+```
+
+For future syncs, add `export ATS_OBSIDIAN_PLANS=1` to your shell startup file.
+Without this setting, ATS skips plans setup before checking dependencies or
+changing files. Setting it to `0` also skips setup. This setting does not
+uninstall an existing integration or change where its hooks save plans.
+
+When enabled, plans live only in `~/Developer/Personal/plans`, under one folder
+per project. Set `ATS_PLANS_VAULT` to choose another shared directory. ATS
+preserves existing notes and Obsidian settings. The integration needs Python
+3.11 or newer and uses no Obsidian community plugin.
+
+ATS installs managed instruction blocks and lifecycle hooks for installed agents.
 Session hooks resolve the repository, including linked worktrees, and supply
 its canonical plan directory. Claude gets file access through
 `permissions.additionalDirectories`; Codex gets the vault in its workspace
@@ -108,21 +121,21 @@ sandbox's `writable_roots`. Other permissions and hooks are preserved.
 
 Claude's default `~/.claude/plans` is linked to `Inbox/Claude` inside the vault.
 An existing native plans directory is moved intact when that Inbox is unused;
-conflicting directories or links are preserved and reported. The user-level
-`plansDirectory` override is removed because Claude rejects custom directories
+ATS preserves and reports conflicting directories or links. It removes the user-level
+`plansDirectory` override because Claude rejects custom directories
 outside the project root. Project-level overrides still take precedence; remove
 those if native drafts continue landing in a code repository.
 
-Approved Claude `ExitPlanMode` output and Codex `<proposed_plan>` responses are
-saved automatically in the resolved project folder, with project, agent,
+Hooks save approved Claude `ExitPlanMode` output and Codex `<proposed_plan>`
+responses in the resolved project folder, with project, agent,
 session, creation time, type, and status properties. Native Claude drafts stay
-in the Inbox; approved snapshots are separate knowledge notes. Other answers
-are not saved as plans. Designs, specs, decisions, and reviews written through
+in the Inbox; approved snapshots are separate knowledge notes. Hooks ignore
+other answers. Designs, specs, decisions, and reviews written through
 normal file tools follow the same canonical directory from the instructions.
 
 Open **Plans Home.md** in Obsidian for linked project indexes, or **Plans.base**
-for a table of note properties. Existing dated notes are indexed without being
-rewritten. Indexes refresh at session start and after plan/turn completion;
+for a table of note properties. ATS indexes existing dated notes without
+rewriting them. Indexes refresh at session start and after plan/turn completion;
 ordinary code repositories receive no generated planning files. Handwritten
 indexes are preserved and use a separate generated index when names conflict.
 
@@ -139,8 +152,8 @@ python3 -m unittest discover -s test -p 'test_*.py' -q
 bash test/mutate.sh      # mutation testing against the test suite
 ```
 
-Pure decision functions (parsing `caveman status`, `headroom install status`, config files, etc.) are isolated from their side-effecting orchestration functions specifically so they can be unit-tested without a live install. See `test/harness.sh` for the (dependency-free, no bats/shunit2) assertion helpers.
+Tests exercise parsing and setup decisions without a live tool installation. The shell assertion helpers are in `test/harness.sh` and need no test framework.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 # Shared Markdown plans vault; no Obsidian community plugin or daemon required.
 
+obsidian_enabled() {
+  [ "${ATS_OBSIDIAN_PLANS:-0}" = 1 ]
+}
+
 setup_obsidian() {
   section "obsidian plans"
+  if ! obsidian_enabled; then
+    skip "optional integration; set ATS_OBSIDIAN_PLANS=1 to enable setup"
+    return 0
+  fi
   local agents=() vault
   have claude && agents+=(claude)
   have codex && agents+=(codex)

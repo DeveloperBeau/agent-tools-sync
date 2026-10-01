@@ -106,8 +106,10 @@ main() {
   echo "  claude-mem → cross-session memory plugin in both, worker daemon on its own port"
   echo "  ship       → optional private plugin in both agents"
   echo "  skillopt   → skill optimization CLI, Claude plugin, and Codex skill"
-  echo "  plans      → shared Obsidian vault, automatic Claude and Codex plan capture"
-  echo "  Just run 'claude' or 'codex' as usual — nothing else to launch."
+  if obsidian_enabled; then
+    echo "  plans      → shared Obsidian vault, automatic Claude and Codex plan capture"
+  fi
+  echo "  Run 'claude' or 'codex' as usual."
 }
 
 main "$@"
