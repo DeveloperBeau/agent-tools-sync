@@ -4,7 +4,7 @@
 
 c_reset=$'\033[0m'; c_bold=$'\033[1m'; c_green=$'\033[32m'; c_yellow=$'\033[33m'
 c_red=$'\033[31m'; c_blue=$'\033[34m'
-ATS_VERSION=1.6.0
+ATS_VERSION=1.6.1
 
 section() { printf '\n%s== %s ==%s\n' "$c_bold$c_blue" "$1" "$c_reset"; }
 ok()      { printf '  %s✔%s %s\n' "$c_green" "$c_reset" "$1"; }
