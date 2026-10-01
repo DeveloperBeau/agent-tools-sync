@@ -57,6 +57,8 @@ For proxy-only startup that leaves the memory worker and the installed Headroom 
 
 During full sync, ATS checks tool updates before setup. Headroom stays pinned to the diagnostic fork; upstream release checks report updates without replacing it. Installing a new pinned Headroom revision or updating Caveman restarts its running proxy. CLI hooks use updated executables on their next invocation. Existing agent sessions and the claude-mem worker keep running.
 
+The ATS-managed Caveman hook bridge removes unsupported context output from Codex `PostCompact` callbacks while preserving lifecycle recording, warnings, and stop controls. Codex restores Caveman context through its supported `SessionStart` callback with `source: compact`. This correction survives vendor CLI updates.
+
 Optional standalone watchdog records separate Claude and ChatGPT Codex route health, captures incident evidence, and performs bounded Headroom recovery. It respects deliberate proxy stops and can capture reports manually. See [proxy recovery instructions](PROXY_RECOVERY.md) for installation, upstream fork maintenance, and rollback. ATS does not install or activate the watchdog automatically.
 
 `ats kill` is a hard stop — nothing auto-restarts headroom's proxy afterward (unlike caveman, which self-starts on the next agent session). Since caveman chains every request through headroom, both agents get connection-refused on the last hop until you run `ats start` or `ats`.

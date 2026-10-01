@@ -926,3 +926,151 @@ index 98bf7e9..47e6720 100644
  // limit. Larger requests still flow normally and retain provider usage/pricing.
  const requestAccountingMaxBytes = 4 << 20
  
+diff --git a/proxy/internal/nativehook/hook.go b/proxy/internal/nativehook/hook.go
+--- a/proxy/internal/nativehook/hook.go
++++ b/proxy/internal/nativehook/hook.go
+@@ -37,7 +37,7 @@
+ 	}
+ 	eventName := normalizeEvent(agent, firstString(event, "hook_event_name", "event_name", "event"))
+ 	if eventName != "PreToolUse" && eventName != "PermissionRequest" {
+-		delegate(ctx, adapterPath, agent, raw, stdout, stderr)
++		delegate(ctx, adapterPath, agent, eventName, raw, stdout, stderr)
+ 		return nil
+ 	}
+ 	sessionID := bounded(firstString(event, "session_id", "sessionId"), 160)
+@@ -381,7 +381,7 @@
+ 	_ = os.Chmod(path, 0o600)
+ }
+ 
+-func delegate(ctx context.Context, adapterPath, agent string, raw []byte, stdout, stderr io.Writer) {
++func delegate(ctx context.Context, adapterPath, agent, eventName string, raw []byte, stdout, stderr io.Writer) {
+ 	if adapterPath == "" {
+ 		return
+ 	}
+@@ -397,7 +397,23 @@
+ 	if cmd.Run() != nil {
+ 		return
+ 	}
+-	_, _ = stdout.Write(out.Bytes())
++	output := out.Bytes()
++	if agent == "codex" && eventName == "PostCompact" {
++		// Codex accepts only common output fields here. Context restoration
++		// belongs to SessionStart with source=compact; keep lifecycle work and
++		// common controls such as continue:false from the delegated adapter.
++		var result map[string]json.RawMessage
++		if json.Unmarshal(output, &result) == nil && result != nil {
++			if _, exists := result["hookSpecificOutput"]; exists {
++				delete(result, "hookSpecificOutput")
++				output = nil
++				if len(result) != 0 {
++					output, _ = json.Marshal(result)
++				}
++			}
++		}
++	}
++	_, _ = stdout.Write(output)
+ 	_, _ = stderr.Write(errOut.Bytes())
+ }
+ 
+diff --git a/proxy/internal/nativehook/hook_codex_output_test.go b/proxy/internal/nativehook/hook_codex_output_test.go
+new file mode 100644
+--- /dev/null
++++ b/proxy/internal/nativehook/hook_codex_output_test.go
+@@ -0,0 +1,97 @@
++package nativehook
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"testing"
++)
++
++func TestDelegatedCodexPostCompactOutput(t *testing.T) {
++	node, err := exec.LookPath("node")
++	if err != nil {
++		t.Skip("Node adapter runtime unavailable")
++	}
++	t.Setenv("NODE", node)
++	home := t.TempDir()
++	adapter := filepath.Join(home, "adapter.cjs")
++	input := filepath.Join(home, "input.json")
++	t.Setenv("CAVE_TEST_INPUT", input)
++	if err := os.WriteFile(adapter, []byte(`
++const fs = require("node:fs");
++let raw = "";
++process.stdin.on("data", chunk => { raw += chunk; });
++process.stdin.on("end", () => {
++  fs.writeFileSync(process.env.CAVE_TEST_INPUT, raw);
++  process.stdout.write(process.env.CAVE_TEST_OUTPUT);
++  process.stderr.write("adapter diagnostic\n");
++});
++`), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	contextOutput := `{"hookSpecificOutput":{"hookEventName":"PostCompact","additionalContext":"restore core"}}`
++	for _, tc := range []struct {
++		name, agent, event, output string
++		strip                      bool
++	}{
++		{"codex context only", "codex", "PostCompact", contextOutput, true},
++		{"codex controls and context", "codex", "PostCompact", `{"continue":false,"stopReason":"operator stop","systemMessage":"warning","suppressOutput":true,"hookSpecificOutput":{"hookEventName":"PostCompact","additionalContext":"restore core"}}`, true},
++		{"codex valid controls", "codex", "PostCompact", `{"continue":false,"stopReason":"operator stop"}`, false},
++		{"codex compact session start", "codex", "SessionStart", `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"restore core"}}`, false},
++		{"claude context unchanged", "claude", "PostCompact", contextOutput, false},
++		{"codex other event unchanged", "codex", "UserPromptSubmit", contextOutput, false},
++		{"malformed output remains visible", "codex", "PostCompact", `{"hookSpecificOutput":`, false},
++		{"empty output unchanged", "codex", "PostCompact", "", false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Setenv("CAVE_TEST_OUTPUT", tc.output)
++			raw, err := json.Marshal(map[string]string{"hook_event_name": tc.event, "session_id": "compact-test", "source": "compact"})
++			if err != nil {
++				t.Fatal(err)
++			}
++			var stdout, stderr bytes.Buffer
++			if err := Run(context.Background(), home, tc.agent, adapter, raw, &stdout, &stderr); err != nil {
++				t.Fatal(err)
++			}
++			recorded, err := os.ReadFile(input)
++			if err != nil || !bytes.Equal(recorded, raw) {
++				t.Fatalf("lifecycle input changed: %q (%v)", recorded, err)
++			}
++			if stderr.String() != "adapter diagnostic\n" {
++				t.Fatalf("adapter diagnostic lost: %q", stderr.String())
++			}
++			if !tc.strip {
++				if stdout.String() != tc.output {
++					t.Fatalf("unrelated output changed: %q", stdout.String())
++				}
++				return
++			}
++			var expected map[string]json.RawMessage
++			if err := json.Unmarshal([]byte(tc.output), &expected); err != nil {
++				t.Fatal(err)
++			}
++			delete(expected, "hookSpecificOutput")
++			if len(expected) == 0 {
++				if stdout.Len() != 0 {
++					t.Fatalf("unsupported context reached Codex: %q", stdout.String())
++				}
++				return
++			}
++			var actual map[string]json.RawMessage
++			if err := json.Unmarshal(stdout.Bytes(), &actual); err != nil {
++				t.Fatal(err)
++			}
++			if len(actual) != len(expected) {
++				t.Fatalf("unexpected output fields: %s", stdout.Bytes())
++			}
++			for key, value := range expected {
++				if !bytes.Equal(actual[key], value) {
++					t.Fatalf("common field %s changed: %s", key, stdout.Bytes())
++				}
++			}
++		})
++	}
++}
