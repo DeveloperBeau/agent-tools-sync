@@ -491,27 +491,36 @@ def _write_json(path: Path, data: dict) -> bool:
         if isinstance(previous, dict):
             data["last_stream_diagnostics"] = {"time": _metadata(previous.get("time"), "time"),
                                                "data": _metadata(previous.get("data"))}
-    if path.parent == INCIDENTS and not path.exists():
-        retained = sorted(p for p in INCIDENTS.glob("*.json")
-                          if re.fullmatch(r"\d{8}T\d{12}Z-(?:codex|claude|manual|first-fault|headroom_health_endpoint)\.json", p.name))
-        needed = max(0, len(retained) + 1 - INCIDENT_LIMIT)
+    temporary = path.with_suffix(".tmp")
+    if path.parent == INCIDENTS:
+        retained = sorted(p for p in INCIDENTS.iterdir()
+                          if re.fullmatch(r"\d{8}T\d{12}Z-(?:codex|claude|manual|first-fault|headroom_health_endpoint)\.(?:json|tmp)", p.name))
+        # Reserve staging space even for updates; never expire their last good copy.
+        needed = max(0, len(retained) + (temporary not in retained) - INCIDENT_LIMIT)
+        expired_files = [p for p in retained if p not in {path, temporary}]
         storage = {"availability": "capacity_unavailable", "limit": INCIDENT_LIMIT,
                    "retained_files": len(retained), "reason": "existing_directory_over_limit" if len(retained) > INCIDENT_LIMIT
                    else "incident_file_limit"}
-        for expired in retained[:needed]:
+        for expired in expired_files[:needed]:
             try:
                 expired.unlink(missing_ok=True)
                 storage["retained_files"] -= 1
             except OSError as error:
                 data["incident_storage"] = {**storage, "probe_error": type(error).__name__}
                 return False
-        if needed > len(retained):
+        if needed > len(expired_files):
             data["incident_storage"] = storage
             return False
     data.pop("incident_storage", None)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(data, indent=2) + "\n")
-    temporary.replace(path)
+    try:
+        temporary.write_text(json.dumps(data, indent=2) + "\n")
+        temporary.replace(path)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     return True
 
 

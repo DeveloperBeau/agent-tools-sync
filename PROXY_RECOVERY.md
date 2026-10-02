@@ -47,13 +47,17 @@ include unrelated traffic.
 
 With a compatible Headroom build, each new `/debug/streams.first_faults` ID is
 saved on the next poll, independently of route health and restart cooldown.
-The watchdog retains 64 first-fault links and bounds generated incident files to
-64. It checks capacity and expires old files before creating another report;
+The watchdog retains 64 first-fault links and bounds generated incident files,
+including `.tmp` staging leftovers, to 64. It reserves staging capacity and
+expires old files before each write, including updates to existing reports;
 concurrent manual/watch writes share a native directory lock. If expiration or
 locking is unavailable, the watcher replaces one bounded `incident_fallback`
 record inside its complete state file, saves it before restart, and updates it
 with aftermath. Capacity refusals retain safe availability/error-type metadata
 and leave health polling/recovery operational. An unsaved fault remains retryable.
+Failed writes attempt staging cleanup; undeletable leftovers still count toward
+capacity. Updating a report preserves its last good copy, so an update uses the
+state fallback when there is no room for both that copy and its staging file.
 The same fallback handles refused updates to an existing report, including the
 restart decision, cooldown and aftermath. Once a report moves into state, its
 later updates stay there; report paths identify the state file even when an older

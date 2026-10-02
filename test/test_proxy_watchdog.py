@@ -316,6 +316,102 @@ class RecoveryDecisionTests(unittest.TestCase):
             self.assertNotIn("secret sentinel", json.dumps(state))
             self.assertGreater(faults, 3)
 
+    def test_failed_staging_with_denied_cleanup_is_bounded_and_recovery_continues(self):
+        for failure in ("replace", "partial_write"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                incidents = root / "incidents"
+                incidents.mkdir()
+                unrelated = incidents / "operator.tmp"
+                unrelated.write_text("preserve me")
+                state_path = root / "state.json"
+                state_path.write_text('{"operator_setting":"preserve_me"}')
+                snapshot = {"pid": 42, "active": [], "connections": [], "first_faults": [
+                    {"fault_id": "fault-1", "pid": 42, "kind": "transport_error"}]}
+                routes = {"codex": route("unhealthy", "sse_error")}
+                original_write, original_replace = pathlib.Path.write_text, pathlib.Path.replace
+                failed_stages = []
+                counts = []
+                decisions = []
+
+                def write(path, data, *args, **kwargs):
+                    if path.parent == incidents and failure == "partial_write":
+                        original_write(path, data[:10], *args, **kwargs)
+                        failed_stages.append(path)
+                        raise OSError("secret partial write")
+                    return original_write(path, data, *args, **kwargs)
+
+                def replace(path, target):
+                    if path.parent == incidents and failure == "replace":
+                        failed_stages.append(path)
+                        raise PermissionError("secret replace")
+                    return original_replace(path, target)
+
+                def restart():
+                    stored = json.loads(state_path.read_text())
+                    self.assertEqual(stored["last_attempt"], 10000)
+                    self.assertEqual(stored["incident"], str(state_path))
+                    self.assertEqual(stored["incident_fallback"]["data"]["restart_decision"]["decision"], "restart")
+                    return {"exit_code": 0}
+
+                def sleep(_):
+                    counts.append(len(list(incidents.iterdir())) - 1)
+                    saved = json.loads(state_path.read_text())
+                    decisions.append(saved["incident_fallback"]["data"].get("restart_decision", {}).get("decision"))
+                    if len(counts) == 5:
+                        raise KeyboardInterrupt
+
+                with patch.multiple(watchdog, STATE_PATH=state_path, INCIDENTS=incidents, INCIDENT_LIMIT=1), \
+                     patch.object(watchdog, "_get_json", side_effect=lambda url: snapshot if url == watchdog.STREAMS_URL else routes if url == watchdog.ROUTE_URL else {"ready": True}), \
+                     patch.object(watchdog, "_listener_memory", return_value=None), \
+                     patch.object(watchdog, "_safe_log_tail", return_value=[]), \
+                     patch.object(watchdog, "_safe_caveman_tail", return_value=[]), \
+                     patch.object(watchdog, "_managed_headroom_loaded", return_value=True), \
+                     patch.object(watchdog, "_restart_headroom", side_effect=restart) as restart_mock, \
+                     patch.object(watchdog, "_ready_after_restart", return_value=True), \
+                     patch.object(watchdog, "_notify"), \
+                     patch.object(watchdog.time, "time", return_value=10000), \
+                     patch.object(watchdog.time, "sleep", side_effect=sleep), \
+                     patch.object(watchdog.Path, "write_text", new=write), \
+                     patch.object(watchdog.Path, "replace", new=replace), \
+                     patch.object(watchdog.Path, "unlink", side_effect=PermissionError("secret cleanup")):
+                    with self.assertRaises(KeyboardInterrupt):
+                        watchdog._watch()
+                self.assertEqual(counts, [1] * 5)
+                self.assertEqual(len(failed_stages), 1)
+                self.assertTrue(failed_stages[0].exists())
+                stored = json.loads(state_path.read_text())
+                self.assertEqual(stored["operator_setting"], "preserve_me")
+                self.assertEqual(stored["last_routes"], routes)
+                self.assertEqual(stored["first_fault_incidents"], [])
+                self.assertEqual(stored["first_fault_capture"]["availability"], "capacity_unavailable")
+                self.assertEqual(stored["first_fault_capture"]["retained_files"], 1)
+                self.assertEqual(decisions[:2], ["restart", "restart_cooldown"])
+                self.assertEqual(stored["incident_fallback"]["data"]["first_fault"]["fault_id"], "fault-1")
+                self.assertEqual(restart_mock.call_count, 1)
+                self.assertNotIn("secret", json.dumps(stored))
+                self.assertEqual(unrelated.read_text(), "preserve me")
+                with patch.multiple(watchdog, STATE_PATH=state_path, INCIDENTS=incidents, INCIDENT_LIMIT=2):
+                    watchdog._capture_first_faults(snapshot, stored, 10010)
+                self.assertEqual(stored["first_fault_capture"]["availability"], "available")
+                self.assertEqual(stored["first_fault_incidents"][0]["fault_id"], "fault-1")
+                self.assertLessEqual(len(list(incidents.iterdir())) - 1, 2)
+
+    def test_existing_incident_update_reserves_staging_capacity_and_preserves_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            incident = root / "20260101T000000000000Z-manual.json"
+            incident.write_text('{"kind":"original"}')
+            leftover = root / "20260101T000000000001Z-first-fault.tmp"
+            leftover.write_text("partial")
+            data = {"kind": "update"}
+            with patch.multiple(watchdog, INCIDENTS=root, INCIDENT_LIMIT=2), \
+                 patch.object(watchdog.Path, "unlink", side_effect=PermissionError("secret cleanup")):
+                self.assertFalse(watchdog._save_json(incident, data))
+            self.assertEqual(json.loads(incident.read_text()), {"kind": "original"})
+            self.assertFalse(incident.with_suffix(".tmp").exists())
+            self.assertEqual(data["incident_storage"]["retained_files"], 2)
+
     def test_denied_expiration_rejects_new_files_without_leaving_temporary_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
