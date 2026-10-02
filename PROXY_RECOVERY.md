@@ -45,6 +45,33 @@ three-second deadlines and bounded output; unavailable probes are reported as
 errors rather than preventing recovery. TCP counters are host-wide and may
 include unrelated traffic.
 
+With a compatible Headroom build, each new `/debug/streams.first_faults` ID is
+saved on the next poll, independently of route health and restart cooldown.
+The watchdog retains at most 64 generated incident files and 64 first-fault
+links. Recovery reports link those frozen records and record the decision,
+readiness, loop heartbeat, old/new PID, and pre-restart request IDs. A completion
+or abortion is reported only when the same process's recent history shows it;
+requests missing after restart remain `unknown`. Older builds without
+`first_faults` continue to work.
+
+Minute host samples retain numeric resource/descriptor counts, validated
+default-route/interface and TCP peer addresses, and category-only sleep/wake
+history. Route, VPN-interface, peer/socket and long poll-gap changes are bounded
+context, not proof of the failure's cause. Unsupported platforms/probes report
+availability. Incident files contain parsed, whitelisted metadata; raw logs,
+OS output, restart output and exception messages are omitted.
+
+Packet metadata observation is disabled by default. Explicitly set
+`PROXY_WATCHDOG_PACKET_METADATA=1` in the watchdog's launch environment to allow
+an existing, unprivileged `tcpdump` to observe up to four known IPv4 TCP tuples
+on the validated default-route interface, for one second and at most 64 packet
+headers per sample. No sudo, payload printing or raw packet files are used.
+Unavailable tools, interfaces or permissions leave recovery operational.
+Retained events identify FIN/RST direction and possible repeated sequence ranges;
+sequence repeats are not proof of retransmission or a root cause. This observes
+only the future sample window, cannot reconstruct earlier packets, and does not
+support IPv6 packet monitoring. Disable the variable to stop observation.
+
 Restart success means Headroom restarted and answered its readiness endpoint.
 Provider recovery remains unverified until the next real request completes.
 This is incident capture and bounded recovery, not a proven root-cause fix.

@@ -24,6 +24,226 @@ def route(state, reason, age=1):
 
 
 class RecoveryDecisionTests(unittest.TestCase):
+    def setUp(self):
+        if self._testMethodName not in {"test_host_snapshot_parses_only_route_addresses_and_numeric_counters",
+                                       "test_packet_probe_failures_and_unsupported_host_do_not_expose_error_text"}:
+            host = patch.object(watchdog, "_host_snapshot", return_value={"availability": "fixture"})
+            host.start()
+            self.addCleanup(host.stop)
+        permission = patch.dict(watchdog.os.environ, {"PROXY_WATCHDOG_PACKET_METADATA": "0"})
+        permission.start()
+        self.addCleanup(permission.stop)
+
+    def test_first_fault_is_captured_once_before_route_failure_and_retention_is_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = {}
+            snapshot = {"pid": 42, "active": [], "connections": [], "first_faults": [
+                {"fault_id": "fault-1", "timestamp": "2026-10-03T00:00:00Z", "pid": 42,
+                 "kind": "transport_error", "phase": "read", "request_id": "hr_1",
+                 "error": [{"type": "BrokenPipeError", "message": "secret sentinel"}]}]}
+            with patch.object(watchdog, "INCIDENTS", pathlib.Path(directory)), \
+                 patch.object(watchdog, "_get_json", return_value=snapshot), \
+                 patch.object(watchdog, "_host_snapshot", return_value={}), \
+                 patch.object(watchdog, "_restart_headroom") as restart, \
+                 patch.object(watchdog, "_notify") as notify:
+                watchdog._sample_diagnostics(state, 100)
+                watchdog._sample_diagnostics(state, 110)
+                self.assertEqual(len(list(pathlib.Path(directory).glob("*.json"))), 1)
+                self.assertEqual(state["first_fault_incidents"][0]["fault_id"], "fault-1")
+                for i in range(100):
+                    snapshot["first_faults"][0]["fault_id"] = f"fault-{i + 2}"
+                    watchdog._sample_diagnostics(state, 120 + i)
+            self.assertLessEqual(len(state["first_fault_incidents"]), 64)
+            self.assertLessEqual(len(list(pathlib.Path(directory).glob("*.json"))), 64)
+            self.assertNotIn("secret sentinel", json.dumps(state))
+            restart.assert_not_called()
+            notify.assert_not_called()
+
+    def test_diagnostic_metadata_rejects_queries_headers_bodies_and_unsafe_ids(self):
+        state = {}
+        snapshot = {"pid": 42, "active": [{"request_id": "hr_safe", "session_id": "secret sentinel",
+                    "provider_request_id": "https://host/?secret=sentinel", "body": "secret sentinel",
+                    "waiting": "upstream_read", "headers": {"authorization": "secret sentinel"}}],
+                    "connections": [{"id": 1, "error": [{"type": "BrokenPipeError", "message": "secret sentinel"}]}],
+                    "first_faults": []}
+        with patch.object(watchdog, "_get_json", return_value=snapshot):
+            watchdog._sample_diagnostics(state, 100)
+        retained = json.dumps(state)
+        self.assertNotIn("secret", retained)
+        self.assertNotIn("https://", retained)
+        self.assertIn("hr_safe", retained)
+        self.assertIn("BrokenPipeError", retained)
+
+    def test_host_snapshot_parses_only_route_addresses_and_numeric_counters(self):
+        outputs = ["Routing tables\n gateway: 192.0.2.1\n interface: en0\nsecret sentinel\n",
+                   "tcp:\n 12 packets retransmitted\n 3 connections dropped\nsecret sentinel\n",
+                   "p42\nf1\nn192.0.2.2:50000->198.51.100.5:443\nTST=ESTABLISHED\nsecret sentinel\n",
+                   "p42\nf1\nf2\nsecret sentinel\n", "vm_stat secret sentinel\nPages free: 123.\n",
+                   "2026-10-03 10:00:00 +1000 Sleep Entering Sleep secret sentinel\n"
+                   "2026-10-03 11:00:00 +1000 Wake Wake from Normal Sleep secret sentinel\n"]
+        def run(command, **kwargs):
+            return SimpleNamespace(returncode=0, stdout=outputs.pop(0), stderr="secret sentinel")
+        with patch.object(watchdog.subprocess, "run", side_effect=run), \
+             patch.object(watchdog.sys, "platform", "darwin"), \
+             patch.object(watchdog.os, "getloadavg", return_value=(1.0, 2.0, 3.0)):
+            host = watchdog._host_snapshot({"headroom_8788": {"pid": 42}})
+        self.assertEqual(host["network"]["default_route"]["gateway"], "192.0.2.1")
+        self.assertEqual(host["descriptor_counts"]["headroom_8788"]["count"], 2)
+        self.assertEqual([e["category"] for e in host["power_events"]["events"]], ["sleep", "wake"])
+        self.assertNotIn("secret sentinel", json.dumps(host))
+
+    def test_host_changes_and_sleep_gap_are_categories_not_raw_logs(self):
+        state = {"host_context": {"network": {"default_route": {"interface": "en0", "gateway": "192.0.2.1"},
+                   "sockets": {}}, "sample_wall": 100, "sample_monotonic": 50}}
+        current = {"network": {"default_route": {"interface": "utun2", "gateway": "192.0.2.2"}, "sockets": {}}}
+        with patch.object(watchdog, "_host_snapshot", return_value=current), \
+             patch.object(watchdog.time, "monotonic", return_value=60):
+            watchdog._sample_host_context(state, 300)
+        self.assertIn("route_change", state["host_changes"][-1]["categories"])
+        self.assertIn("vpn_interface_transition", state["host_changes"][-1]["categories"])
+        self.assertIn("sleep_or_clock_change", state["host_changes"][-1]["categories"])
+
+    def test_restart_aftermath_links_fault_and_marks_unobserved_requests_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            state = {"first_fault_incidents": [{"fault_id": "fault-1", "pid": 42, "incident": "first-fault.json"}]}
+            before = {"pid": 42, "active": [{"request_id": "hr_done"}, {"request_id": "hr_lost"}],
+                      "event_loop": {"lag_seconds": 0.1}}
+            after = {"pid": 43, "active": [], "recent": [{"request_id": "hr_done", "reason": "completed"}]}
+            def snapshot(url):
+                if url == watchdog.STREAMS_URL:
+                    return before if not state.get("last_attempt") else after
+                return {"ready": True}
+            with patch.multiple(watchdog, STATE_PATH=root / "state.json", INCIDENTS=root / "incidents"), \
+                 patch.object(watchdog, "_snapshot", side_effect=snapshot), \
+                 patch.object(watchdog, "_managed_headroom_loaded", return_value=True), \
+                 patch.object(watchdog, "_listener_memory", return_value=None), \
+                 patch.object(watchdog, "_host_snapshot", return_value={}), \
+                 patch.object(watchdog, "_safe_log_tail", return_value=[]), \
+                 patch.object(watchdog, "_safe_caveman_tail", return_value=[]), \
+                 patch.object(watchdog, "_restart_headroom", return_value={"exit_code": 0}), \
+                 patch.object(watchdog, "_ready_after_restart", return_value=True), \
+                 patch.object(watchdog, "_notify"):
+                watchdog.recover("codex", {"codex": route("unhealthy", "sse_error")}, state, 10000)
+            incident = json.loads(next((root / "incidents").glob("*.json")).read_text())
+            self.assertEqual(incident["restart_decision"]["old_pid"], 42)
+            self.assertEqual(incident["aftermath"]["new_pid"], 43)
+            # A new process's reused request ID cannot prove the old request completed.
+            self.assertEqual([r["outcome"] for r in incident["aftermath"]["requests"]], ["unknown", "unknown"])
+            self.assertEqual(incident["first_fault_incidents"][0]["fault_id"], "fault-1")
+
+    def test_packet_metadata_requires_permission_and_only_retains_tuple_flags(self):
+        sockets = {"headroom_8788": {"connections": [{"local_ip": "192.0.2.2", "local_port": 50000,
+                   "peer_ip": "198.51.100.5", "peer_port": 443}]}}
+        with patch.dict(watchdog.os.environ, {}, clear=True), patch.object(watchdog.subprocess, "run") as run:
+            self.assertEqual(watchdog._packet_metadata(sockets, "en0")["availability"], "disabled_permission_required")
+            run.assert_not_called()
+        output = "1728000000.1 IP 198.51.100.5.443 > 192.0.2.2.50000: Flags [R.], seq 123, ack 456, win 0, length 0\nsecret sentinel\n"
+        with patch.dict(watchdog.os.environ, {"PROXY_WATCHDOG_PACKET_METADATA": "1"}), \
+             patch.object(watchdog.shutil, "which", return_value="/usr/sbin/tcpdump"), \
+             patch.object(watchdog.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=output, stderr="secret sentinel")) as run:
+            result = watchdog._packet_metadata(sockets, "en0")
+        self.assertEqual(result["events"][0]["direction"], "inbound")
+        self.assertTrue(result["events"][0]["rst"])
+        self.assertNotIn("secret sentinel", json.dumps(result))
+        self.assertNotIn("-w", run.call_args.args[0])
+        self.assertNotIn("-A", run.call_args.args[0])
+        self.assertIn("192.0.2.2", run.call_args.args[0][-1])
+
+    def test_packet_metadata_observes_possible_retransmission_without_claiming_cause(self):
+        sockets = {"headroom_8788": {"connections": [{"local_ip": "192.0.2.2", "local_port": 50000,
+                   "peer_ip": "198.51.100.5", "peer_port": 443}]}}
+        line = "1728000000.1 IP 192.0.2.2.50000 > 198.51.100.5.443: Flags [P.], seq 100:200, ack 456, win 0, length 100\n"
+        with patch.dict(watchdog.os.environ, {"PROXY_WATCHDOG_PACKET_METADATA": "1"}), \
+             patch.object(watchdog.shutil, "which", return_value="/usr/sbin/tcpdump"), \
+             patch.object(watchdog.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=line + line, stderr="")):
+            result = watchdog._packet_metadata(sockets, "en0")
+        self.assertTrue(result["events"][1]["possible_retransmission"])
+        self.assertEqual(result["retransmission"], "possible_sequence_repeat")
+
+    def test_first_fault_links_to_recovery_before_restart_and_dedup_survives_reload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            state = {}
+            snapshot = {"pid": 42, "active": [{"record_id": 1, "request_id": "hr_1"}], "connections": [],
+                        "first_faults": [{"fault_id": "fault-1", "pid": 42, "kind": "transport_error"}]}
+            def restart():
+                fault = json.loads(next((root / "incidents").glob("*-first-fault.json")).read_text())
+                recovery = json.loads(pathlib.Path(fault["recovery_incident"]).read_text())
+                self.assertEqual(recovery["restart_decision"]["decision"], "restart")
+                self.assertEqual(fault["recovery"], "restart_requested")
+                return {"exit_code": 1}
+            with patch.multiple(watchdog, STATE_PATH=root / "state.json", INCIDENTS=root / "incidents"), \
+                 patch.object(watchdog, "_get_json", return_value=snapshot), \
+                 patch.object(watchdog, "_snapshot", return_value=snapshot), \
+                 patch.object(watchdog, "_listener_memory", return_value=None), \
+                 patch.object(watchdog, "_safe_log_tail", return_value=[]), \
+                 patch.object(watchdog, "_safe_caveman_tail", return_value=[]), \
+                 patch.object(watchdog, "_managed_headroom_loaded", return_value=True), \
+                 patch.object(watchdog, "_restart_headroom", side_effect=restart), \
+                 patch.object(watchdog, "_ready_after_restart", return_value=False), \
+                 patch.object(watchdog, "_notify"):
+                watchdog._sample_diagnostics(state, 100)
+                watchdog._save_json(root / "state.json", state)
+                state = json.loads((root / "state.json").read_text())
+                watchdog._sample_diagnostics(state, 110)
+                watchdog.recover("codex", {"codex": route("unhealthy", "sse_error")}, state, 10000)
+            self.assertEqual(len(list((root / "incidents").glob("*-first-fault.json"))), 1)
+
+    def test_aftermath_reports_only_observed_same_process_outcomes(self):
+        incident = {"restart_decision": {"old_pid": 42, "active_requests": [
+            {"request_id": "hr_done"}, {"request_id": "hr_error"}, {"request_id": "hr_unknown"}]}}
+        after = {"pid": 42, "recent": [{"request_id": "hr_done", "reason": "completed"},
+                 {"request_id": "hr_error", "reason": "interrupted"}]}
+        with patch.object(watchdog, "_snapshot", return_value=after):
+            result = watchdog._restart_aftermath(incident)
+        self.assertEqual([r["outcome"] for r in result["requests"]], ["completed", "aborted", "unknown"])
+
+    def test_packet_probe_failures_and_unsupported_host_do_not_expose_error_text(self):
+        with patch.object(watchdog.sys, "platform", "unsupported"), patch.object(watchdog.subprocess, "run") as run:
+            host = watchdog._host_snapshot({})
+        self.assertEqual(host["availability"], "unsupported_platform")
+        run.assert_not_called()
+        sockets = {"headroom_8788": {"connections": [{"local_ip": "192.0.2.2", "local_port": 50000,
+                   "peer_ip": "198.51.100.5", "peer_port": 443}]}}
+        with patch.dict(watchdog.os.environ, {"PROXY_WATCHDOG_PACKET_METADATA": "1"}), \
+             patch.object(watchdog.shutil, "which", return_value="/usr/sbin/tcpdump"), \
+             patch.object(watchdog.subprocess, "run", side_effect=PermissionError("secret sentinel")):
+            result = watchdog._packet_metadata(sockets, "en0")
+        self.assertEqual(result["availability"], "probe_unavailable")
+        self.assertNotIn("secret sentinel", json.dumps(result))
+
+    def test_metadata_retention_preserves_six_hours_of_memory_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = {"memory_samples": [{"time": "2026-10-03T00:00:00Z", "headroom_8788": {"pid": i}}
+                                       for i in range(360)]}
+            path = pathlib.Path(directory) / "state.json"
+            with patch.object(watchdog, "STATE_PATH", path):
+                watchdog._save_json(path, state)
+            self.assertEqual(len(json.loads(path.read_text())["memory_samples"]), 360)
+
+    def test_first_fault_schema_keeps_tls_tcp_session_pool_and_frame_metadata(self):
+        snapshot = {"forensics_schema": 1, "pid": 42, "active": [], "connections": [], "first_faults": [{
+            "fault_id": "fault-1", "pid": 42, "kind": "transport_error", "phase": "socket_read",
+            "request": {"client_request_id": "12345678-1234-1234-1234-123456789abc", "session_ids": {
+                "session_id": "0123456789abcdef01234567"}, "waits": {"upstream_read": {"active_ms": 125}},
+                "upstream_ids": {"request-id": "safe-id"}},
+            "connection": {"tls": {"availability": "available", "alpn": "h2", "version": "TLSv1.3"},
+                "tcp": {"availability": "available", "rtt_ms": 12, "tx_retransmit_packets": 3},
+                "http2": {"remote_settings": {"max_concurrent_streams": 100}, "frame_counts": {"inbound": {"RST_STREAM": 1}},
+                          "recent_frames": [{"type": 3, "stream_id": 9, "error_code": 2}]}},
+            "pool": {"availability": "available", "origins": [{"origin_id": "0123456789abcdef01234567", "active_streams": 2}]}}]}
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(watchdog, "INCIDENTS", pathlib.Path(directory)), patch.object(watchdog, "_get_json", return_value=snapshot):
+                watchdog._sample_diagnostics({}, 100)
+            incident = json.loads(next(pathlib.Path(directory).glob("*.json")).read_text())
+        fault = incident["first_fault"]
+        self.assertEqual(fault["connection"]["tls"]["version"], "TLSv1.3")
+        self.assertEqual(fault["connection"]["tcp"]["tx_retransmit_packets"], 3)
+        self.assertEqual(fault["request"]["session_ids"]["session_id"], "0123456789abcdef01234567")
+        self.assertEqual(fault["request"]["waits"]["upstream_read"]["active_ms"], 125)
+        self.assertEqual(fault["connection"]["http2"]["frame_counts"]["inbound"]["RST_STREAM"], 1)
+
     def test_process_sample_includes_cpu_and_state_without_command_line(self):
         results = [SimpleNamespace(stdout="123\n"),
                    SimpleNamespace(stdout="2048 8192 01:30 12.5 S\n")]
@@ -34,11 +254,30 @@ class RecoveryDecisionTests(unittest.TestCase):
         self.assertEqual(sample["process_state"], "S")
         self.assertNotIn("command", run.call_args.args[0][-1])
 
+    def test_log_and_restart_retention_drops_exception_messages_and_payload_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "logs").mkdir()
+            (root / "logs/proxy-8788.log").write_text('2026-10-03T00:00:00+00:00 event=stream_diagnostic {"kind":"first_fault",'
+                '"request_id":"hr_safe","error":"secret_sentinel","body":"secret sentinel"}\n')
+            (root / ".caveman").mkdir()
+            (root / ".caveman/proxy.log").write_text(json.dumps({"msg": "upstream transport error; retrying",
+                "request_id": "hr_safe", "error": "secret sentinel"}) + "\n")
+            with patch.object(watchdog, "HEADROOM", root), patch.object(watchdog.Path, "home", return_value=root), \
+                 patch.object(watchdog.subprocess, "run", side_effect=PermissionError("secret sentinel")):
+                retained = {"logs": watchdog._safe_log_tail(), "caveman": watchdog._safe_caveman_tail(),
+                            "restart": watchdog._restart_headroom()}
+        self.assertNotIn("secret", json.dumps(retained))
+        self.assertIn("hr_safe", json.dumps(retained))
+        self.assertEqual(retained["restart"]["probe_error"], "PermissionError")
+        self.assertEqual(retained["logs"][0]["time"], "2026-10-03T00:00:00+00:00")
+
     def test_network_snapshot_is_bounded_and_command_failures_are_nonfatal(self):
-        result = SimpleNamespace(returncode=0, stdout="x" * 20000, stderr="secret sentinel")
+        result = SimpleNamespace(returncode=0, stdout="x" * 100000, stderr="secret sentinel")
         with patch.object(watchdog.subprocess, "run", return_value=result):
             snapshot = watchdog._network_snapshot({"headroom_8788": {"pid": 123}})
-        self.assertLessEqual(len(snapshot["tcp_counters"]["output"]), 8000)
+        self.assertNotIn("output", snapshot["tcp_counters"])
+        self.assertEqual(snapshot["tcp_counters"]["counters"], {})
         self.assertTrue(snapshot["tcp_counters"]["truncated"])
         self.assertIn("headroom_8788", snapshot["sockets"])
         self.assertNotIn("secret sentinel", json.dumps(snapshot))
@@ -51,8 +290,8 @@ class RecoveryDecisionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             calls = []
             state = {
-                "last_stream_diagnostics": {"time": "before", "data": {"active": []}},
-                "diagnostic_samples": [{"time": "earlier", "active": []}],
+                "last_stream_diagnostics": {"time": "2026-10-03T00:00:00Z", "data": {"active": []}},
+                "diagnostic_samples": [{"time": "2026-10-02T00:00:00Z", "active": []}],
             }
             def snapshot(url):
                 calls.append(url)
