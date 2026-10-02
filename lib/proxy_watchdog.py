@@ -515,6 +515,28 @@ def _write_json(path: Path, data: dict) -> bool:
     return True
 
 
+def _save_incident(path: Path, incident: dict, state: dict, *, secondary=False) -> Path | None:
+    """Keep all updates for a refused incident in one watcher-owned fallback."""
+    fallback = state.get("incident_fallback") or {}
+    if not secondary and fallback.get("requested_path") == str(path):
+        incident.setdefault("incident_storage", (fallback.get("data") or {}).get("incident_storage") or {
+            "availability": "probe_unavailable", "reason": "incident_write_refused"})
+        state["incident_fallback"] = {"requested_path": str(path), "data": incident}
+        return STATE_PATH
+    try:
+        saved = _save_json(path, incident)
+    except OSError as error:
+        incident["incident_storage"] = {"availability": "probe_unavailable", "probe_error": type(error).__name__}
+        saved = False
+    if saved is False:
+        incident.setdefault("incident_storage", {"availability": "probe_unavailable", "reason": "incident_write_refused"})
+        if secondary:
+            return None
+        state["incident_fallback"] = {"requested_path": str(path), "data": incident}
+        return STATE_PATH
+    return path
+
+
 def _notify(message: str) -> None:
     try:
         subprocess.run(
@@ -623,7 +645,7 @@ def _persist_first_faults(snapshot: dict, state: dict, now: float) -> dict | Non
                     "stream_diagnostics": snapshot, "host": host or {"availability": "pending"},
                     "host_changes": state.get("host_changes", [])[-32:],
                     "recovery": "not_requested_by_first_fault", "outcome": "unknown"}
-        if _save_json(path, incident) is False:
+        if _save_incident(path, incident, state) == STATE_PATH:
             return incident["incident_storage"]
         retained.append({"fault_id": fault_id, "pid": fault.get("pid"), "time": stamp, "incident": str(path)})
         retained[:] = retained[-64:]
@@ -631,7 +653,8 @@ def _persist_first_faults(snapshot: dict, state: dict, now: float) -> dict | Non
         if host is None:
             host = _host_snapshot()
         incident["host"] = host
-        _save_json(path, incident)
+        if _save_incident(path, incident, state) == STATE_PATH:
+            return incident["incident_storage"]
 
 
 def _managed_headroom_loaded() -> bool:
@@ -680,10 +703,7 @@ def _capture_incident(route: str, routes: dict, state: dict) -> tuple[Path, dict
         "memory_samples": [_metadata(sample) for sample in state.get("memory_samples", [])[-SAMPLE_LIMIT:]],
     }
     incident_path = INCIDENTS / f"{datetime.now(timezone.utc):%Y%m%dT%H%M%S%fZ}-{route}.json"
-    if _save_json(incident_path, incident) is False:
-        # A single replacement record preserves recovery evidence without adding
-        # files when old incidents cannot be expired.
-        state["incident_fallback"] = {"requested_path": str(incident_path), "data": incident}
+    _save_incident(incident_path, incident, state)
     return incident_path, incident
 
 
@@ -708,8 +728,7 @@ def _report_cooldown_failure(route: str, routes: dict, state: dict, now: float, 
                    "last_attempt": state["last_attempt"], "cooldown_remaining_seconds": remaining}
     incident["recovery_suppressed"] = suppression
     incident["restart_decision"] = _restart_decision(route, incident, "restart_cooldown")
-    _save_json(incident_path, incident)
-    report_path = incident_path if incident_path.exists() else STATE_PATH
+    report_path = _save_incident(incident_path, incident, state)
     alerts[route] = {**suppression, "detected_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
                      "incident": str(report_path)}
     state["incident"] = str(report_path)
@@ -733,21 +752,13 @@ def recover(route: str, routes: dict, state: dict, now: float) -> bool:
         return False
     incident_path, incident = _capture_incident(route, routes, state)
     incident["restart_decision"] = _restart_decision(route, incident, "restart")
-    _save_json(incident_path, incident)
-    report_path = incident_path if incident_path.exists() else STATE_PATH
-    for fault in incident["first_fault_incidents"]:
-        old_pid = incident["restart_decision"].get("old_pid")
-        if old_pid is not None and fault.get("pid") != old_pid:
-            continue
-        path = Path(fault.get("incident", ""))
-        if path.parent == INCIDENTS and path.name.endswith("-first-fault.json") and path.exists():
-            try:
-                frozen = json.loads(path.read_text())
-                frozen["recovery_incident"] = str(report_path)
-                frozen["recovery"] = "restart_requested"
-                _save_json(path, frozen)
-            except (OSError, ValueError, TypeError):
-                pass
+    report_path = _save_incident(incident_path, incident, state)
+    _link_first_faults(incident, state, report_path)
+    updated_path = _save_incident(incident_path, incident, state)
+    if updated_path != report_path:
+        report_path = updated_path
+        _link_first_faults(incident, state, report_path)
+        _save_incident(incident_path, incident, state)
     state.update(last_attempt=now, incident=str(report_path), cooldown_alerts={})
     _save_json(STATE_PATH, state)
     incident["restart"] = _restart_headroom()
@@ -756,9 +767,13 @@ def recover(route: str, routes: dict, state: dict, now: float) -> bool:
     # subsequent real request can establish route health after restart.
     incident["provider_recovery"] = "unverified_pending_real_traffic"
     incident["aftermath"] = _restart_aftermath(incident)
-    if _save_json(incident_path, incident) is False:
-        state["incident_fallback"] = {"requested_path": str(incident_path), "data": incident}
-        _save_json(STATE_PATH, state)
+    updated_path = _save_incident(incident_path, incident, state)
+    if updated_path != report_path:
+        report_path = updated_path
+        _link_first_faults(incident, state, report_path)
+        _save_incident(incident_path, incident, state)
+    state["incident"] = str(report_path)
+    _save_json(STATE_PATH, state)
     restarted = incident["restart"]["exit_code"] == 0 and incident["ready_after_restart"]
     message = (
         f"{route} failure; Headroom restarted. API recovery awaits real traffic."
@@ -768,6 +783,27 @@ def recover(route: str, routes: dict, state: dict, now: float) -> bool:
     _notify(message)
     print(f"{datetime.now(timezone.utc).isoformat()} {message} {report_path}", flush=True)
     return True
+
+
+def _link_first_faults(incident: dict, state: dict, report_path: Path) -> None:
+    updates = []
+    for fault in incident.get("first_fault_incidents", [])[-64:]:
+        old_pid = incident["restart_decision"].get("old_pid")
+        if old_pid is not None and fault.get("pid") != old_pid:
+            continue
+        path = Path(fault.get("incident", ""))
+        status = {"availability": "probe_unavailable", "reason": "incident_file_expired_or_unavailable"}
+        if path.parent == INCIDENTS and path.name.endswith("-first-fault.json") and path.exists():
+            try:
+                frozen = json.loads(path.read_text())
+                frozen["recovery_incident"] = str(report_path)
+                frozen["recovery"] = "restart_requested"
+                saved_path = _save_incident(path, frozen, state, secondary=True)
+                status = {"availability": "available"} if saved_path is not None else frozen["incident_storage"]
+            except (OSError, ValueError, TypeError) as error:
+                status = {"availability": "probe_unavailable", "probe_error": type(error).__name__}
+        updates.append({"fault_id": _metadata(fault.get("fault_id"), "fault_id"), "incident": str(path), **status})
+    incident["first_fault_link_updates"] = updates
 
 
 def _restart_decision(route: str, incident: dict, decision: str) -> dict:

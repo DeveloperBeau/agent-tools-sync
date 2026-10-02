@@ -54,6 +54,13 @@ locking is unavailable, the watcher replaces one bounded `incident_fallback`
 record inside its complete state file, saves it before restart, and updates it
 with aftermath. Capacity refusals retain safe availability/error-type metadata
 and leave health polling/recovery operational. An unsaved fault remains retryable.
+The same fallback handles refused updates to an existing report, including the
+restart decision, cooldown and aftermath. Once a report moves into state, its
+later updates stay there; report paths identify the state file even when an older
+incident file still exists. Successful initial first-fault writes stay deduplicated
+when host enrichment is refused, with the refused enrichment retained in state.
+Recovery reports record bounded availability for updates to frozen fault links;
+a refused link update cannot replace the primary recovery fallback.
 Recovery reports link frozen records and record the decision,
 readiness, loop heartbeat, old/new PID, and pre-restart request IDs. A completion
 or abortion is reported only when the same process's recent history shows it;

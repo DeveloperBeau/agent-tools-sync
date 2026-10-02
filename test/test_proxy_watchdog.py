@@ -396,6 +396,122 @@ class RecoveryDecisionTests(unittest.TestCase):
             self.assertIn("storage unavailable", output.getvalue())
             self.assertNotIn("Captured proxy evidence", output.getvalue())
 
+    def test_restart_decision_update_refusal_preserves_state_before_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            state_path = root / "state.json"
+            state = {}
+            original_save = watchdog._save_json
+            def save(path, data):
+                if path.parent == root / "incidents" and "restart_decision" in data:
+                    data["incident_storage"] = {"availability": "capacity_unavailable", "reason": "incident_writer_busy"}
+                    return False
+                return original_save(path, data)
+            def restart():
+                initial = json.loads(next((root / "incidents").glob("*-codex.json")).read_text())
+                self.assertNotIn("restart_decision", initial)
+                stored = json.loads(state_path.read_text())
+                self.assertIn("incident_fallback", stored)
+                self.assertEqual(stored["incident_fallback"]["data"]["restart_decision"]["decision"], "restart")
+                self.assertEqual(stored["last_attempt"], 10000)
+                self.assertEqual(stored["incident"], str(state_path))
+                return {"exit_code": 0}
+            with patch.multiple(watchdog, STATE_PATH=state_path, INCIDENTS=root / "incidents"), \
+                 patch.object(watchdog, "_save_json", side_effect=save), \
+                 patch.object(watchdog, "_snapshot", return_value={"pid": 42, "active": [], "first_faults": []}), \
+                 patch.object(watchdog, "_listener_memory", return_value=None), \
+                 patch.object(watchdog, "_safe_log_tail", return_value=[]), \
+                 patch.object(watchdog, "_safe_caveman_tail", return_value=[]), \
+                 patch.object(watchdog, "_managed_headroom_loaded", return_value=True), \
+                 patch.object(watchdog, "_restart_headroom", side_effect=restart), \
+                 patch.object(watchdog, "_ready_after_restart", return_value=True), patch.object(watchdog, "_notify"):
+                watchdog.recover("codex", {"codex": route("unhealthy", "sse_error")}, state, 10000)
+            stored = json.loads(state_path.read_text())
+            self.assertEqual(stored["incident_fallback"]["data"]["aftermath"]["new_pid"], 42)
+
+    def test_cooldown_and_aftermath_update_refusals_use_actual_fallback_path(self):
+        for field in ("recovery_suppressed", "aftermath"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                state_path = root / "state.json"
+                state = {"last_attempt": 9500} if field == "recovery_suppressed" else {}
+                original_save = watchdog._save_json
+                def save(path, data):
+                    if path.parent == root / "incidents" and field in data:
+                        data["incident_storage"] = {"availability": "capacity_unavailable", "reason": "incident_writer_busy"}
+                        return False
+                    return original_save(path, data)
+                with patch.multiple(watchdog, STATE_PATH=state_path, INCIDENTS=root / "incidents"), \
+                     patch.object(watchdog, "_save_json", side_effect=save), \
+                     patch.object(watchdog, "_snapshot", return_value={"pid": 42, "active": [], "first_faults": []}), \
+                     patch.object(watchdog, "_listener_memory", return_value=None), \
+                     patch.object(watchdog, "_safe_log_tail", return_value=[]), \
+                     patch.object(watchdog, "_safe_caveman_tail", return_value=[]), \
+                     patch.object(watchdog, "_managed_headroom_loaded", return_value=True), \
+                     patch.object(watchdog, "_restart_headroom", return_value={"exit_code": 0}), \
+                     patch.object(watchdog, "_ready_after_restart", return_value=True), patch.object(watchdog, "_notify"):
+                    watchdog.recover("codex", {"codex": route("unhealthy", "sse_error")}, state, 10000)
+                stored = json.loads(state_path.read_text())
+                self.assertIn("incident_fallback", stored)
+                self.assertIn(field, stored["incident_fallback"]["data"])
+                self.assertEqual(stored["incident"], str(state_path))
+                if field == "recovery_suppressed":
+                    self.assertEqual(stored["cooldown_alerts"]["codex"]["incident"], str(state_path))
+
+    def test_first_fault_enrichment_update_refusal_retains_saved_id_and_availability(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            state = {}
+            snapshot = {"pid": 42, "active": [], "connections": [], "first_faults": [
+                {"fault_id": "fault-1", "pid": 42, "kind": "transport_error"}]}
+            original_save = watchdog._save_json
+            def save(path, data):
+                if path.parent == root and data.get("host", {}).get("availability") == "fixture":
+                    data["incident_storage"] = {"availability": "capacity_unavailable", "reason": "incident_writer_busy"}
+                    return False
+                return original_save(path, data)
+            with patch.object(watchdog, "INCIDENTS", root), patch.object(watchdog, "_save_json", side_effect=save), \
+                 patch.object(watchdog, "_get_json", return_value=snapshot):
+                watchdog._sample_diagnostics(state, 10000)
+            self.assertEqual(state["first_fault_incidents"][0]["fault_id"], "fault-1")
+            self.assertEqual(state["first_fault_capture"]["availability"], "capacity_unavailable")
+            self.assertEqual(state["incident_fallback"]["data"]["first_fault"]["fault_id"], "fault-1")
+            self.assertEqual(len(list(root.iterdir())), 1)
+
+    def test_first_fault_link_refusal_is_explicit_without_replacing_restart_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            incidents = root / "incidents"
+            incidents.mkdir()
+            first = incidents / "20260101T000000000000Z-first-fault.json"
+            first.write_text('{"first_fault":{"fault_id":"fault-1","pid":42}}')
+            state_path = root / "state.json"
+            state = {"first_fault_incidents": [{"fault_id": "fault-1", "pid": 42, "incident": str(first)}]}
+            original_save = watchdog._save_json
+            def save(path, data):
+                if path.parent == incidents and ("restart_decision" in data or "recovery_incident" in data):
+                    data["incident_storage"] = {"availability": "capacity_unavailable", "reason": "incident_writer_busy"}
+                    return False
+                return original_save(path, data)
+            def restart():
+                stored = json.loads(state_path.read_text())
+                self.assertIn("incident_fallback", stored)
+                fallback = stored["incident_fallback"]["data"]
+                self.assertEqual(fallback["restart_decision"]["decision"], "restart")
+                self.assertEqual(fallback["first_fault_link_updates"][0]["availability"], "capacity_unavailable")
+                self.assertNotIn("recovery_incident", json.loads(first.read_text()))
+                return {"exit_code": 0}
+            with patch.multiple(watchdog, STATE_PATH=state_path, INCIDENTS=incidents), \
+                 patch.object(watchdog, "_save_json", side_effect=save), \
+                 patch.object(watchdog, "_snapshot", return_value={"pid": 42, "active": [], "first_faults": []}), \
+                 patch.object(watchdog, "_listener_memory", return_value=None), \
+                 patch.object(watchdog, "_safe_log_tail", return_value=[]), \
+                 patch.object(watchdog, "_safe_caveman_tail", return_value=[]), \
+                 patch.object(watchdog, "_managed_headroom_loaded", return_value=True), \
+                 patch.object(watchdog, "_restart_headroom", side_effect=restart), \
+                 patch.object(watchdog, "_ready_after_restart", return_value=True), patch.object(watchdog, "_notify"):
+                watchdog.recover("codex", {"codex": route("unhealthy", "sse_error")}, state, 10000)
+
     def test_first_fault_links_to_recovery_before_restart_and_dedup_survives_reload(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
