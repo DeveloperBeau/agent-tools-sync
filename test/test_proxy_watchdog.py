@@ -1,8 +1,11 @@
 import importlib.util
+import ctypes
+import ctypes.util
 import pathlib
 import json
 import plistlib
 import tempfile
+import struct
 import unittest
 from http.client import IncompleteRead
 from unittest.mock import patch
@@ -62,6 +65,7 @@ class RecoveryDecisionTests(unittest.TestCase):
     def test_diagnostic_metadata_rejects_queries_headers_bodies_and_unsafe_ids(self):
         state = {}
         snapshot = {"pid": 42, "active": [{"request_id": "hr_safe", "session_id": "secret sentinel",
+                    "session_ids": {"conversation_id": "secret_sentinel"},
                     "provider_request_id": "https://host/?secret=sentinel", "body": "secret sentinel",
                     "waiting": "upstream_read", "headers": {"authorization": "secret sentinel"}}],
                     "connections": [{"id": 1, "error": [{"type": "BrokenPipeError", "message": "secret sentinel"}]}],
@@ -150,7 +154,7 @@ class RecoveryDecisionTests(unittest.TestCase):
         self.assertNotIn("-A", run.call_args.args[0])
         self.assertIn("192.0.2.2", run.call_args.args[0][-1])
 
-    def test_packet_metadata_observes_possible_retransmission_without_claiming_cause(self):
+    def test_packet_metadata_rejects_payload_and_marks_retransmission_unavailable(self):
         sockets = {"headroom_8788": {"connections": [{"local_ip": "192.0.2.2", "local_port": 50000,
                    "peer_ip": "198.51.100.5", "peer_port": 443}]}}
         line = "1728000000.1 IP 192.0.2.2.50000 > 198.51.100.5.443: Flags [P.], seq 100:200, ack 456, win 0, length 100\n"
@@ -158,8 +162,126 @@ class RecoveryDecisionTests(unittest.TestCase):
              patch.object(watchdog.shutil, "which", return_value="/usr/sbin/tcpdump"), \
              patch.object(watchdog.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=line + line, stderr="")):
             result = watchdog._packet_metadata(sockets, "en0")
-        self.assertTrue(result["events"][1]["possible_retransmission"])
-        self.assertEqual(result["retransmission"], "possible_sequence_repeat")
+        self.assertEqual(result["events"], [])
+        self.assertEqual(result["retransmission"], "unavailable_control_only_capture")
+
+    def test_packet_filter_accepts_only_unfragmented_ipv4_without_tcp_payload(self):
+        sockets = {"headroom_8788": {"connections": [{"local_ip": "192.0.2.2", "local_port": 50000,
+                   "peer_ip": "198.51.100.5", "peer_port": 443}]}}
+        with patch.dict(watchdog.os.environ, {"PROXY_WATCHDOG_PACKET_METADATA": "1"}), \
+             patch.object(watchdog.shutil, "which", return_value="/usr/sbin/tcpdump"), \
+             patch.object(watchdog.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as run:
+            watchdog._packet_metadata(sockets, "en0")
+        expression = run.call_args.args[0][-1].encode("ascii")
+        library = ctypes.util.find_library("pcap")
+        if library is None:
+            self.skipTest("libpcap offline filter unavailable")
+        pcap = ctypes.CDLL(library)
+        class Program(ctypes.Structure):
+            _fields_ = [("length", ctypes.c_uint), ("instructions", ctypes.c_void_p)]
+        class Timeval(ctypes.Structure):
+            _fields_ = [("seconds", ctypes.c_long), ("microseconds", ctypes.c_long)]
+        class Header(ctypes.Structure):
+            _fields_ = [("time", Timeval), ("captured", ctypes.c_uint32), ("length", ctypes.c_uint32)]
+        pcap.pcap_open_dead.argtypes = [ctypes.c_int, ctypes.c_int]
+        pcap.pcap_open_dead.restype = ctypes.c_void_p
+        pcap.pcap_compile.argtypes = [ctypes.c_void_p, ctypes.POINTER(Program), ctypes.c_char_p, ctypes.c_int, ctypes.c_uint32]
+        pcap.pcap_offline_filter.argtypes = [ctypes.POINTER(Program), ctypes.POINTER(Header), ctypes.c_void_p]
+        pcap.pcap_freecode.argtypes = [ctypes.POINTER(Program)]
+        pcap.pcap_close.argtypes = [ctypes.c_void_p]
+        handle = pcap.pcap_open_dead(1, 65535)  # Ethernet; no device or capture is opened.
+        program = Program()
+        try:
+            self.assertEqual(pcap.pcap_compile(handle, ctypes.byref(program), expression, 1, 0xffffffff), 0)
+            def accepted(payload=b"", ip_options=0, tcp_options=0, fragments=0, peer_port=443, truncate=0):
+                ip_length, tcp_length = 20 + ip_options, 20 + tcp_options
+                ip = struct.pack("!BBHHHBBH4s4s", 0x40 + ip_length // 4, 0, ip_length + tcp_length + len(payload),
+                                 0, fragments, 64, 6, 0, bytes((192, 0, 2, 2)), bytes((198, 51, 100, 5)))
+                tcp = struct.pack("!HHIIBBHHH", 50000, peer_port, 100, 200, (tcp_length // 4) << 4, 0x11, 0, 0, 0)
+                packet = bytes(12) + b"\x08\x00" + ip + bytes(ip_options) + tcp + bytes(tcp_options) + payload
+                if truncate:
+                    packet = packet[:-truncate]
+                buffer = ctypes.create_string_buffer(packet)
+                header = Header(Timeval(0, 0), len(packet), len(packet))
+                return bool(pcap.pcap_offline_filter(ctypes.byref(program), ctypes.byref(header), buffer))
+            for ip_options, tcp_options in ((0, 0), (4, 0), (0, 12), (40, 40)):
+                with self.subTest(ip_options=ip_options, tcp_options=tcp_options):
+                    self.assertTrue(accepted(ip_options=ip_options, tcp_options=tcp_options))
+                    self.assertFalse(accepted(b"private payload", ip_options=ip_options, tcp_options=tcp_options))
+            self.assertFalse(accepted(fragments=0x2000))
+            self.assertFalse(accepted(fragments=1))
+            self.assertFalse(accepted(peer_port=8443))
+            self.assertFalse(accepted(truncate=12))
+        finally:
+            pcap.pcap_freecode(ctypes.byref(program))
+            pcap.pcap_close(handle)
+
+    def test_first_fault_write_failure_does_not_block_recovery_or_dedup_unsaved_fault(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            state_path = root / "state.json"
+            state_path.write_text("{}")
+            snapshot = {"pid": 42, "active": [], "connections": [], "first_faults": [
+                {"fault_id": "fault-1", "pid": 42, "kind": "transport_error"}]}
+            routes = {"codex": route("unhealthy", "sse_error")}
+            def get_json(url):
+                return snapshot if url == watchdog.STREAMS_URL else routes if url == watchdog.ROUTE_URL else {"ready": True}
+            original_save = watchdog._save_json
+            def save(path, data):
+                if path.name.endswith("-first-fault.json"):
+                    raise PermissionError("secret sentinel")
+                original_save(path, data)
+            with patch.multiple(watchdog, STATE_PATH=state_path, INCIDENTS=root / "incidents"), \
+                 patch.object(watchdog, "_get_json", side_effect=get_json), \
+                 patch.object(watchdog, "_save_json", side_effect=save), \
+                 patch.object(watchdog, "_listener_memory", return_value=None), \
+                 patch.object(watchdog, "_safe_log_tail", return_value=[]), \
+                 patch.object(watchdog, "_safe_caveman_tail", return_value=[]), \
+                 patch.object(watchdog, "_managed_headroom_loaded", return_value=True), \
+                 patch.object(watchdog, "_restart_headroom", return_value={"exit_code": 0}), \
+                 patch.object(watchdog, "_ready_after_restart", return_value=True), \
+                 patch.object(watchdog, "_notify"), \
+                 patch.object(watchdog.time, "time", return_value=10000), \
+                 patch.object(watchdog.time, "sleep", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    watchdog._watch()
+            state = json.loads(state_path.read_text())
+            self.assertIn("last_routes", state)
+            self.assertEqual(state["last_routes"]["codex"]["state"], "unhealthy")
+            self.assertEqual(state["last_attempt"], 10000)
+            self.assertEqual(state["first_fault_capture"]["probe_error"], "PermissionError")
+            self.assertNotIn("secret sentinel", json.dumps(state))
+            self.assertEqual(state["first_fault_incidents"], [])
+            incident = json.loads(next((root / "incidents").glob("*-codex.json")).read_text())
+            self.assertEqual(incident["restart_decision"]["decision"], "restart")
+            with patch.object(watchdog, "INCIDENTS", root / "incidents"), patch.object(watchdog, "_get_json", return_value=snapshot):
+                watchdog._sample_diagnostics(state, 10010)
+            self.assertEqual(state["first_fault_incidents"][0]["fault_id"], "fault-1")
+
+    def test_incident_expiration_failure_keeps_saved_evidence_and_recovery_operational(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            incidents = root / "incidents"
+            incidents.mkdir()
+            for i in range(64):
+                (incidents / f"20260101T000000{i:06}Z-manual.json").write_text("{}")
+            snapshot = {"pid": 42, "active": [], "connections": [], "first_faults": []}
+            state = {}
+            with patch.multiple(watchdog, STATE_PATH=root / "state.json", INCIDENTS=incidents), \
+                 patch.object(watchdog, "_snapshot", return_value=snapshot), \
+                 patch.object(watchdog, "_listener_memory", return_value=None), \
+                 patch.object(watchdog, "_safe_log_tail", return_value=[]), \
+                 patch.object(watchdog, "_safe_caveman_tail", return_value=[]), \
+                 patch.object(watchdog, "_managed_headroom_loaded", return_value=True), \
+                 patch.object(watchdog, "_restart_headroom", return_value={"exit_code": 0}), \
+                 patch.object(watchdog, "_ready_after_restart", return_value=True), \
+                 patch.object(watchdog, "_notify"), \
+                 patch.object(watchdog.Path, "unlink", side_effect=PermissionError("secret sentinel")):
+                watchdog.recover("codex", {"codex": route("unhealthy", "sse_error")}, state, 10000)
+            incident = json.loads(next(incidents.glob("*-codex.json")).read_text())
+            self.assertEqual(incident["restart"]["exit_code"], 0)
+            self.assertEqual(incident["incident_retention"]["probe_error"], "PermissionError")
+            self.assertNotIn("secret sentinel", json.dumps(incident))
 
     def test_first_fault_links_to_recovery_before_restart_and_dedup_survives_reload(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -226,13 +348,16 @@ class RecoveryDecisionTests(unittest.TestCase):
         snapshot = {"forensics_schema": 1, "pid": 42, "active": [], "connections": [], "first_faults": [{
             "fault_id": "fault-1", "pid": 42, "kind": "transport_error", "phase": "socket_read",
             "request": {"client_request_id": "12345678-1234-1234-1234-123456789abc", "session_ids": {
-                "session_id": "0123456789abcdef01234567"}, "waits": {"upstream_read": {"active_ms": 125}},
+                "session_id": "0123456789abcdef01234567", "x-session-id": "1123456789abcdef01234567",
+                "x-claude-code-session-id": "2123456789abcdef01234567", "conversation_id": "3123456789abcdef01234567"},
+                "waits": {"upstream_read": {"active_ms": 125}},
                 "upstream_ids": {"request-id": "safe-id"}},
             "connection": {"tls": {"availability": "available", "alpn": "h2", "version": "TLSv1.3"},
                 "tcp": {"availability": "available", "rtt_ms": 12, "tx_retransmit_packets": 3},
                 "http2": {"remote_settings": {"max_concurrent_streams": 100}, "frame_counts": {"inbound": {"RST_STREAM": 1}},
                           "recent_frames": [{"type": 3, "stream_id": 9, "error_code": 2}]}},
             "pool": {"availability": "available", "origins": [{"origin_id": "0123456789abcdef01234567", "active_streams": 2}]}}]}
+        snapshot["active"] = [snapshot["first_faults"][0]["request"]]
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(watchdog, "INCIDENTS", pathlib.Path(directory)), patch.object(watchdog, "_get_json", return_value=snapshot):
                 watchdog._sample_diagnostics({}, 100)
@@ -241,6 +366,11 @@ class RecoveryDecisionTests(unittest.TestCase):
         self.assertEqual(fault["connection"]["tls"]["version"], "TLSv1.3")
         self.assertEqual(fault["connection"]["tcp"]["tx_retransmit_packets"], 3)
         self.assertEqual(fault["request"]["session_ids"]["session_id"], "0123456789abcdef01234567")
+        self.assertEqual(set(fault["request"]["session_ids"]), {"session_id", "x-session-id", "x-claude-code-session-id", "conversation_id"})
+        self.assertEqual(set(incident["stream_diagnostics"]["active"][0]["session_ids"]),
+                         {"session_id", "x-session-id", "x-claude-code-session-id", "conversation_id"})
+        wrapper = watchdog._metadata({"kind": "first_fault", "fault": snapshot["first_faults"][0]})
+        self.assertEqual(wrapper["fault"]["request"]["session_ids"]["conversation_id"], "3123456789abcdef01234567")
         self.assertEqual(fault["request"]["waits"]["upstream_read"]["active_ms"], 125)
         self.assertEqual(fault["connection"]["http2"]["frame_counts"]["inbound"]["RST_STREAM"], 1)
 

@@ -75,7 +75,7 @@ WINDOW_UPDATE CONTINUATION request-id x-request-id anthropic-request-id cf-ray
 header_table_size enable_push initial_window_size max_frame_size max_header_list_size
 enable_connect_protocol no_rfc7540_priorities connect_unix_socket send_connection_init retry
 """.split())
-HASH_KEYS = frozenset({"session_id", "x-session-id", "x-claude-code-session-id"})
+HASH_KEYS = frozenset({"session_id", "x-session-id", "x-claude-code-session-id", "conversation_id"})
 METADATA_KEYS |= HASH_KEYS
 METADATA_KEYS |= frozenset("""
 loop_lag_ms max_loop_lag_ms samples uptime_seconds tasks running cancelled_count
@@ -125,7 +125,7 @@ def _metadata(value, key="", depth=0):
     if key in {"error", "errors", "first_error", "stack", "session_ids", "upstream_ids"}:
         return None
     if key in HASH_KEYS:
-        return value if re.fullmatch(r"[0-9a-f]{24,64}", value) else None
+        return value if re.fullmatch(r"[0-9a-f]{24}", value) else None
     if key in {"http_version", "client_http_version", "upstream_http_version", "alpn"}:
         return value if value in {"1.0", "1.1", "2", "3", "HTTP/1.0", "HTTP/1.1", "HTTP/2", "HTTP/3", "h2", "http/1.1"} else None
     if key in {"time", "timestamp", "captured_at", "last_observed_at", "created_at", "started_at", "updated_at", "ended_at", "completed_at"}:
@@ -394,9 +394,9 @@ def _sample_host_context(state: dict, now: float) -> None:
 
 
 def _packet_metadata(sockets: dict, interface: str | None) -> dict:
-    """Opt-in, exact IPv4 tuples, text headers only; never persist packet bytes."""
+    """Opt-in, exact IPv4 tuples and zero TCP payload, enforced by capture BPF."""
     result = {"availability": "disabled_permission_required", "events": [],
-              "retransmission": "unknown_not_observed", "window_seconds": 1,
+              "retransmission": "unavailable_control_only_capture", "window_seconds": 1,
               "coverage": "future_window_only", "tuple_limit": 4, "ipv6_availability": "unsupported"}
     if os.environ.get("PROXY_WATCHDOG_PACKET_METADATA") != "1":
         return result
@@ -421,9 +421,13 @@ def _packet_metadata(sockets: dict, interface: str | None) -> dict:
     filters = [f"((src host {local} and src port {lp} and dst host {peer} and dst port {pp}) or "
                f"(src host {peer} and src port {pp} and dst host {local} and dst port {lp}))"
                for local, lp, peer, pp in tuples]
-    # No -w/-A/-X: tcpdump emits header summaries only; capture is tuple-filtered.
+    # BPF rejects fragments and requires total IP length == IP + TCP headers.
+    # The kernel admits zero TCP payload bytes regardless of either option length.
+    controls = ("ip and (ip[0] & 0xf0 = 0x40) and (ip[0] & 0x0f >= 5) "
+                "and (ip[6:2] & 0x3fff = 0) and (tcp[12] & 0xf0 >= 0x50) "
+                "and (ip[2:2] = ((ip[0] & 0x0f) * 4 + ((tcp[12] & 0xf0) >> 2)))")
     command = [binary, "-n", "-tt", "-l", "-S", "-s", "96", "-c", "64", "-i", interface,
-               "tcp and (" + " or ".join(filters) + ")"]
+               controls + " and (" + " or ".join(filters) + ")"]
     try:
         captured = subprocess.run(command, capture_output=True, text=True, timeout=1, check=False)
         if captured.returncode:
@@ -437,10 +441,10 @@ def _packet_metadata(sockets: dict, interface: str | None) -> dict:
         return {**result, "availability": "probe_unavailable", "probe_error": type(error).__name__}
     pattern = r"^(\d+(?:\.\d+)?) IP (\d+(?:\.\d+){3})\.(\d+) > (\d+(?:\.\d+){3})\.(\d+): Flags \[([FSRPAU.EW]+)\]"
     events = []
-    sequences = set()
     for line in output[:16000].splitlines():
         match = re.match(pattern, line)
-        if not match:
+        length = re.search(r"\blength (\d+)\b", line)
+        if not match or not length or int(length[1]) != 0:
             continue
         src, sp, dst, dp = match[2], int(match[3]), match[4], int(match[5])
         direction = None
@@ -449,22 +453,12 @@ def _packet_metadata(sockets: dict, interface: str | None) -> dict:
         elif (dst, dp, src, sp) in tuples:
             direction = "inbound"
         if direction:
-            repeated = False
-            sequence = re.search(r"\bseq (\d+):(\d+)\b", line)
-            length = re.search(r"\blength (\d+)\b", line)
-            if sequence and length and int(length[1]) > 0:
-                identity = (src, sp, dst, dp, int(sequence[1]), int(sequence[2]))
-                repeated = identity in sequences
-                sequences.add(identity)
             events.append({"time_epoch": float(match[1]), "direction": direction, "fin": "F" in match[6],
                            "rst": "R" in match[6], "local_port": sp if direction == "outbound" else dp,
                            "peer_port": dp if direction == "outbound" else sp,
                            "local_ip": src if direction == "outbound" else dst,
-                           "peer_ip": dst if direction == "outbound" else src,
-                           "possible_retransmission": repeated})
-    return {**result, "availability": "available", "events": events[:64],
-            "retransmission": "possible_sequence_repeat" if any(e["possible_retransmission"] for e in events)
-                              else "unknown_not_observed"}
+                           "peer_ip": dst if direction == "outbound" else src})
+    return {**result, "availability": "available", "events": events[:64]}
 
 
 def _save_json(path: Path, data: dict) -> None:
@@ -485,7 +479,18 @@ def _save_json(path: Path, data: dict) -> None:
         retained = sorted(p for p in INCIDENTS.glob("*.json")
                           if re.fullmatch(r"\d{8}T\d{12}Z-(?:codex|claude|manual|first-fault|headroom_health_endpoint)\.json", p.name))
         for expired in retained[:-INCIDENT_LIMIT]:
-            expired.unlink(missing_ok=True)
+            try:
+                expired.unlink(missing_ok=True)
+            except OSError as error:
+                data["incident_retention"] = {"availability": "probe_unavailable", "probe_error": type(error).__name__}
+                # The incident is already saved. Optional retention/enrichment must
+                # not turn a successful evidence write into a skipped recovery.
+                try:
+                    temporary.write_text(json.dumps(data, indent=2) + "\n")
+                    temporary.replace(path)
+                except OSError:
+                    pass
+                break
 
 
 def _notify(message: str) -> None:
@@ -564,6 +569,19 @@ def _sample_diagnostics(state: dict, now: float) -> None:
 
 
 def _capture_first_faults(snapshot: dict, state: dict, now: float) -> None:
+    if not isinstance(snapshot.get("first_faults"), list):
+        state["first_fault_capture"] = {"availability": "unsupported_proxy_schema"}
+        return
+    try:
+        _persist_first_faults(snapshot, state, now)
+    except Exception as error:
+        # Observation failures must not skip health polling or existing recovery.
+        state["first_fault_capture"] = {"availability": "probe_unavailable", "probe_error": type(error).__name__}
+    else:
+        state["first_fault_capture"] = {"availability": "available"}
+
+
+def _persist_first_faults(snapshot: dict, state: dict, now: float) -> None:
     faults = snapshot.get("first_faults") or []
     if not isinstance(faults, list):
         return
@@ -584,13 +602,13 @@ def _capture_first_faults(snapshot: dict, state: dict, now: float) -> None:
                     "host_changes": state.get("host_changes", [])[-32:],
                     "recovery": "not_requested_by_first_fault", "outcome": "unknown"}
         _save_json(path, incident)
+        retained.append({"fault_id": fault_id, "pid": fault.get("pid"), "time": stamp, "incident": str(path)})
+        retained[:] = retained[-64:]
+        seen.add(fault_id)
         if host is None:
             host = _host_snapshot()
         incident["host"] = host
         _save_json(path, incident)
-        retained.append({"fault_id": fault_id, "pid": fault.get("pid"), "time": stamp, "incident": str(path)})
-        retained[:] = retained[-64:]
-        seen.add(fault_id)
 
 
 def _managed_headroom_loaded() -> bool:
@@ -631,6 +649,7 @@ def _capture_incident(route: str, routes: dict, state: dict) -> tuple[Path, dict
         "host": host,
         "host_changes": state.get("host_changes", [])[-32:],
         "first_fault_incidents": state.get("first_fault_incidents", [])[-64:],
+        "first_fault_capture": state.get("first_fault_capture"),
         "readiness": _metadata(_snapshot(READY_URL)),
         "tasks": _metadata(_snapshot("http://127.0.0.1:8788/debug/tasks")),
         "stream_logs": _safe_log_tail(),
