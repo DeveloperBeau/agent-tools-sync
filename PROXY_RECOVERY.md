@@ -47,14 +47,24 @@ include unrelated traffic.
 
 With a compatible Headroom build, each new `/debug/streams.first_faults` ID is
 saved on the next poll, independently of route health and restart cooldown.
-The watchdog retains 64 first-fault links and expires generated incident files
-above a target of 64. Capture/expiration failures retain safe availability and
-error-type metadata and leave health polling/recovery operational. An unsaved
-fault is retried on a later poll. Recovery reports link frozen records and record the decision,
+The watchdog retains 64 first-fault links and bounds generated incident files to
+64. It checks capacity and expires old files before creating another report;
+concurrent manual/watch writes share a native directory lock. If expiration or
+locking is unavailable, the watcher replaces one bounded `incident_fallback`
+record inside its complete state file, saves it before restart, and updates it
+with aftermath. Capacity refusals retain safe availability/error-type metadata
+and leave health polling/recovery operational. An unsaved fault remains retryable.
+Recovery reports link frozen records and record the decision,
 readiness, loop heartbeat, old/new PID, and pre-restart request IDs. A completion
 or abortion is reported only when the same process's recent history shows it;
 requests missing after restart remain `unknown`. Older builds without
 `first_faults` continue to work.
+
+An existing oversized incident directory cannot be brought under the bound while
+the OS forbids deletion; no new incident files are added and this condition is
+reported explicitly. Manual capture never persists fallback into watcher state,
+so it cannot restore stale cooldown/core fields. When full or busy, manual capture
+reports that no new report was saved; automatic recovery uses the state fallback.
 
 Minute host samples retain numeric resource/descriptor counts, validated
 default-route/interface and TCP peer addresses, and category-only sleep/wake

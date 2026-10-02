@@ -1,12 +1,16 @@
 import importlib.util
 import ctypes
 import ctypes.util
+import io
 import pathlib
 import json
 import plistlib
 import tempfile
 import struct
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
 from http.client import IncompleteRead
 from unittest.mock import patch
 from types import SimpleNamespace
@@ -258,30 +262,139 @@ class RecoveryDecisionTests(unittest.TestCase):
                 watchdog._sample_diagnostics(state, 10010)
             self.assertEqual(state["first_fault_incidents"][0]["fault_id"], "fault-1")
 
-    def test_incident_expiration_failure_keeps_saved_evidence_and_recovery_operational(self):
+    def test_persistent_expiration_failure_bounds_files_and_preserves_recovery(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             incidents = root / "incidents"
             incidents.mkdir()
-            for i in range(64):
-                (incidents / f"20260101T000000{i:06}Z-manual.json").write_text("{}")
-            snapshot = {"pid": 42, "active": [], "connections": [], "first_faults": []}
-            state = {}
-            with patch.multiple(watchdog, STATE_PATH=root / "state.json", INCIDENTS=incidents), \
-                 patch.object(watchdog, "_snapshot", return_value=snapshot), \
+            existing = incidents / "20260101T000000000000Z-manual.json"
+            existing.write_text("{}")
+            state_path = root / "state.json"
+            state_path.write_text('{"operator_setting":"preserve_me"}')
+            faults = 0
+            restarted = False
+            def get_json(url):
+                nonlocal faults
+                if url == watchdog.STREAMS_URL:
+                    faults += 1
+                    return {"pid": 42, "active": [], "connections": [], "first_faults": [
+                        {"fault_id": f"fault-{faults}", "pid": 42, "kind": "transport_error"}]}
+                if url == watchdog.ROUTE_URL:
+                    return {"codex": route("unhealthy", "sse_error")}
+                return {"ready": True}
+            def restart():
+                nonlocal restarted
+                stored = json.loads(state_path.read_text())
+                self.assertLessEqual(len(list(incidents.iterdir())), 1)
+                self.assertIn("incident_fallback", stored)
+                self.assertEqual(stored["incident_fallback"]["data"]["restart_decision"]["decision"], "restart")
+                restarted = True
+                return {"exit_code": 0}
+            with patch.multiple(watchdog, STATE_PATH=state_path, INCIDENTS=incidents, INCIDENT_LIMIT=1), \
+                 patch.object(watchdog, "_get_json", side_effect=get_json), \
                  patch.object(watchdog, "_listener_memory", return_value=None), \
                  patch.object(watchdog, "_safe_log_tail", return_value=[]), \
                  patch.object(watchdog, "_safe_caveman_tail", return_value=[]), \
                  patch.object(watchdog, "_managed_headroom_loaded", return_value=True), \
-                 patch.object(watchdog, "_restart_headroom", return_value={"exit_code": 0}), \
+                 patch.object(watchdog, "_restart_headroom", side_effect=restart), \
                  patch.object(watchdog, "_ready_after_restart", return_value=True), \
                  patch.object(watchdog, "_notify"), \
+                 patch.object(watchdog.time, "time", return_value=10000), \
+                 patch.object(watchdog.time, "sleep", side_effect=[None, None, KeyboardInterrupt]), \
                  patch.object(watchdog.Path, "unlink", side_effect=PermissionError("secret sentinel")):
-                watchdog.recover("codex", {"codex": route("unhealthy", "sse_error")}, state, 10000)
-            incident = json.loads(next(incidents.glob("*-codex.json")).read_text())
-            self.assertEqual(incident["restart"]["exit_code"], 0)
-            self.assertEqual(incident["incident_retention"]["probe_error"], "PermissionError")
-            self.assertNotIn("secret sentinel", json.dumps(incident))
+                with self.assertRaises(KeyboardInterrupt):
+                    watchdog._watch()
+            state = json.loads(state_path.read_text())
+            self.assertLessEqual(len(list(incidents.iterdir())), 1)
+            self.assertTrue(restarted)
+            self.assertEqual(state["last_attempt"], 10000)
+            self.assertEqual(state["operator_setting"], "preserve_me")
+            self.assertEqual(state["last_routes"]["codex"]["state"], "unhealthy")
+            self.assertEqual(state["first_fault_incidents"], [])
+            self.assertEqual(state["first_fault_capture"]["availability"], "capacity_unavailable")
+            self.assertEqual(state["incident_fallback"]["data"]["incident_storage"]["probe_error"], "PermissionError")
+            self.assertNotIn("secret sentinel", json.dumps(state))
+            self.assertGreater(faults, 3)
+
+    def test_denied_expiration_rejects_new_files_without_leaving_temporary_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            with patch.multiple(watchdog, INCIDENTS=root, INCIDENT_LIMIT=1), \
+                 patch.object(watchdog.Path, "unlink", side_effect=PermissionError("secret sentinel")):
+                for i in range(3):
+                    path = root / f"20260101T000000{i:06}Z-manual.json"
+                    data = {"time": "2026-01-01T00:00:00Z"}
+                    saved = watchdog._save_json(path, data)
+                    self.assertLessEqual(len(list(root.iterdir())), 1)
+                    if i:
+                        self.assertIs(saved, False)
+                        self.assertEqual(data["incident_storage"]["availability"], "capacity_unavailable")
+                        self.assertNotIn("secret sentinel", json.dumps(data))
+
+    def test_concurrent_incident_writers_cannot_race_past_capacity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            first = root / "20260101T000000000000Z-manual.json"
+            second = root / "20260101T000000000001Z-manual.json"
+            entered, release = threading.Event(), threading.Event()
+            original_write = pathlib.Path.write_text
+            def write(path, *args, **kwargs):
+                if path == first.with_suffix(".tmp"):
+                    entered.set()
+                    release.wait(2)
+                return original_write(path, *args, **kwargs)
+            with patch.multiple(watchdog, INCIDENTS=root, INCIDENT_LIMIT=1), \
+                 patch.object(watchdog.Path, "write_text", new=write), \
+                 patch.object(watchdog.Path, "unlink", side_effect=PermissionError("secret sentinel")), \
+                 ThreadPoolExecutor(max_workers=2) as pool:
+                pending = pool.submit(watchdog._save_json, first, {"kind": "metadata"})
+                try:
+                    self.assertTrue(entered.wait(1))
+                    data = {"kind": "metadata"}
+                    saved = pool.submit(watchdog._save_json, second, data).result(timeout=1)
+                    self.assertIs(saved, False)
+                    self.assertEqual(data["incident_storage"]["reason"], "incident_writer_busy")
+                finally:
+                    release.set()
+                    pending.result(timeout=1)
+            self.assertLessEqual(len(list(root.iterdir())), 1)
+
+    def test_existing_oversized_incident_directory_is_reported_without_growing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for i in range(3):
+                (root / f"20260101T000000{i:06}Z-manual.json").write_text("{}")
+            data = {"kind": "metadata"}
+            with patch.multiple(watchdog, INCIDENTS=root, INCIDENT_LIMIT=1), \
+                 patch.object(watchdog.Path, "unlink", side_effect=PermissionError("secret sentinel")):
+                saved = watchdog._save_json(root / "20260101T000000000003Z-manual.json", data)
+            self.assertIs(saved, False)
+            self.assertEqual(data["incident_storage"]["reason"], "existing_directory_over_limit")
+            self.assertEqual(data["incident_storage"]["retained_files"], 3)
+            self.assertEqual(len(list(root.iterdir())), 3)
+
+    def test_manual_capture_at_capacity_leaves_watcher_state_untouched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            incidents = root / "incidents"
+            incidents.mkdir()
+            (incidents / "20260101T000000000000Z-manual.json").write_text("{}")
+            state_path = root / "state.json"
+            state_path.write_text('{"last_attempt":9500,"cooldown_alerts":{"codex":{"last_attempt":9500}}}')
+            before = state_path.read_bytes()
+            output = io.StringIO()
+            with patch.multiple(watchdog, STATE_PATH=state_path, INCIDENTS=incidents, INCIDENT_LIMIT=1), \
+                 patch.object(watchdog, "_snapshot", return_value={"pid": 42, "active": [], "connections": [], "first_faults": []}), \
+                 patch.object(watchdog, "_listener_memory", return_value=None), \
+                 patch.object(watchdog, "_safe_log_tail", return_value=[]), \
+                 patch.object(watchdog, "_safe_caveman_tail", return_value=[]), \
+                 patch.object(watchdog.Path, "unlink", side_effect=PermissionError("secret sentinel")), \
+                 patch.object(watchdog.os, "umask"), redirect_stdout(output):
+                watchdog.capture()
+            self.assertEqual(state_path.read_bytes(), before)
+            self.assertLessEqual(len(list(incidents.iterdir())), 1)
+            self.assertIn("storage unavailable", output.getvalue())
+            self.assertNotIn("Captured proxy evidence", output.getvalue())
 
     def test_first_fault_links_to_recovery_before_restart_and_dedup_survives_reload(self):
         with tempfile.TemporaryDirectory() as directory:
