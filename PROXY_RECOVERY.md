@@ -152,7 +152,10 @@ ats watchdog fire
 
 This captures evidence before restarting Headroom. It honors `ats kill` stop
 intent and an unloaded Headroom deployment; use `ats start` to resume services.
-Exit status is nonzero if state is busy, the service is deliberately stopped,
+If polling or shutdown owns the control lock, it reports the wait and allows
+up to three minutes for that operation to finish. It then reads fresh state and
+checks stop intent before recovery.
+Exit status is nonzero if the lock wait times out, the service is deliberately stopped,
 restart fails, or readiness fails. Provider recovery still needs real traffic.
 This command interrupts active proxy requests and manages Headroom only; it
 does not restart the memory worker or Caveman.
@@ -229,8 +232,11 @@ The Headroom route has no default 100 MiB upload rejection. An explicit positive
 413 before forwarding; unknown-length uploads stop when their reader reaches
 the limit. Streamed requests are never replayed, including after upload failure
 or an upstream rejection. Authentication, configured routing, header mapping,
-SSRF checks, cancellation, and upload deadlines remain enforced. Other Caveman
-provider routes retain their existing buffered behavior and default 100 MiB cap.
+SSRF checks, cancellation, and upload deadlines remain enforced. Streamed
+Headroom uploads receive a bounded 15-minute body-read window instead of the
+general 30-second upload deadline; headers and other routes keep existing limits.
+Other Caveman provider routes retain their existing buffered behavior and
+default 100 MiB cap.
 
 Headroom independently streams supported Responses and Messages requests above
 its 100 MiB processing budget unchanged, including requests that arrive without

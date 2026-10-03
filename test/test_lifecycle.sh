@@ -136,12 +136,14 @@ full_sync_start() (
   setup_claude_mem() { :; }
   setup_ship() { :; }
   setup_skillopt() { :; }
+  setup_context7() { order="${order}7"; }
+  setup_serena() { order="${order}N"; }
   setup_obsidian() { order="${order}O"; }
   obsidian_enabled() { return 1; }
   bash() { [ "$*" = '/fixture/proxy-chain.sh start' ] || return 99; order="${order}S"; return "$result"; }
   main >/dev/null
   status=$?
-  [ "$status" = "$result" ] && [ "$order" = RHCOS ]
+  [ "$status" = "$result" ] && [ "$order" = RHC7NOS ]
 )
 check 'full sync starts existing chain after setup' full_sync_start 0
 check 'full sync propagates chain startup failure' full_sync_start 1

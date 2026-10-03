@@ -139,15 +139,76 @@ class RecoveryDecisionTests(unittest.TestCase):
                 self.assertTrue(watchdog.fire())
                 run.assert_called_once()
 
-    def test_manual_fire_is_busy_when_poll_owns_state_and_never_restarts_stopped_service(self):
+    def test_manual_fire_waits_for_poll_and_reads_state_after_lock_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            state_path = root / "state.json"
+            started = threading.Event()
+
+            def fire():
+                started.set()
+                return watchdog.fire()
+
+            with patch.multiple(watchdog, STATE_PATH=state_path, INCIDENTS=root / "incidents"), \
+                 patch.object(watchdog, "_managed_headroom_loaded", return_value=True), \
+                 patch.object(watchdog, "_snapshot", return_value={"ready": True}), \
+                 patch.object(watchdog, "_listener_memory", return_value=None), \
+                 patch.object(watchdog, "_safe_log_tail", return_value=[]), \
+                 patch.object(watchdog, "_safe_caveman_tail", return_value=[]), \
+                 patch.object(watchdog, "_restart_headroom", return_value={"exit_code": 0}), \
+                 patch.object(watchdog, "_ready_after_restart", return_value=True), \
+                 patch.object(watchdog, "_restart_aftermath", return_value={}), \
+                 patch.object(watchdog, "_notify"), redirect_stdout(io.StringIO()) as output, \
+                 ThreadPoolExecutor(max_workers=1) as executor:
+                with watchdog._state_lock():
+                    future = executor.submit(fire)
+                    self.assertTrue(started.wait(1))
+                    with self.assertRaises(TimeoutError):
+                        future.result(timeout=0.05)
+                    state_path.write_text(json.dumps({"operator_setting": "latest poll"}))
+                self.assertTrue(future.result(timeout=5))
+            stored = json.loads(state_path.read_text())
+            self.assertEqual(stored["operator_setting"], "latest poll")
+            self.assertEqual(stored["last_recovery_result"], {"exit_code": 0, "ready": True})
+            self.assertIn("waiting", output.getvalue())
+
+    def test_manual_fire_honors_stop_requested_while_waiting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            started = threading.Event()
+
+            def fire():
+                started.set()
+                return watchdog.fire()
+
+            with patch.multiple(watchdog, STATE_PATH=root / "state.json", INCIDENTS=root / "incidents"), \
+                 patch.dict(watchdog.os.environ, {"CAVEMAN_HOME": directory}), \
+                 patch.object(watchdog, "_snapshot", return_value={}), \
+                 patch.object(watchdog, "_restart_headroom") as restart, \
+                 redirect_stdout(io.StringIO()) as output, ThreadPoolExecutor(max_workers=1) as executor:
+                with watchdog._state_lock():
+                    future = executor.submit(fire)
+                    self.assertTrue(started.wait(1))
+                    with self.assertRaises(TimeoutError):
+                        future.result(timeout=0.05)
+                    (root / "ats-stopped").touch()
+                self.assertFalse(future.result(timeout=5))
+                restart.assert_not_called()
+            self.assertIn("deliberately stopped", output.getvalue())
+
+    def test_manual_fire_times_out_when_poll_keeps_lock_and_never_restarts_stopped_service(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             with patch.multiple(watchdog, STATE_PATH=root / "state.json", INCIDENTS=root / "incidents"), \
                  patch.object(watchdog, "_managed_headroom_loaded", return_value=False), \
                  patch.object(watchdog, "_restart_headroom") as restart, \
                  patch.object(watchdog, "_notify"):
-                with watchdog._state_lock():
+                with watchdog._state_lock(), \
+                     patch.object(watchdog.time, "monotonic", side_effect=[100, 100, 280]), \
+                     patch.object(watchdog.time, "sleep"), redirect_stdout(io.StringIO()) as output:
                     self.assertFalse(watchdog.fire())
+                    self.assertIn("180", output.getvalue())
+                    self.assertFalse((root / "state.json").exists())
                 self.assertFalse(watchdog.fire())
                 restart.assert_not_called()
 

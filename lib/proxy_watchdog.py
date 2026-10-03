@@ -34,6 +34,7 @@ POLL_SECONDS = 10
 COOLDOWN_SECONDS = 30 * 60
 SAMPLE_SECONDS = 60
 SAMPLE_LIMIT = 360
+CONTROL_WAIT_SECONDS = 180
 RECOVERABLE = frozenset({"sse_error", "missing_terminal_event", "interrupted"})
 INCIDENT_LIMIT = 64
 METADATA_KEYS = frozenset("""
@@ -811,10 +812,26 @@ def recover(route: str, routes: dict, state: dict, now: float, *, force=False) -
 
 
 @contextmanager
-def _state_lock(*, blocking=True):
+def _state_lock(*, blocking=True, timeout=None):
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with STATE_PATH.with_suffix(".control.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        if timeout is None:
+            fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        else:
+            deadline = time.monotonic() + timeout
+            waiting = False
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    if not waiting:
+                        print(f"Watchdog busy; waiting up to {timeout}s for control lock...", flush=True)
+                        waiting = True
+                    time.sleep(min(0.1, remaining))
         yield
 
 
@@ -831,7 +848,7 @@ def fire() -> bool:
     """Force a recovery attempt while retaining stop intent and writer ownership."""
     os.umask(0o077)
     try:
-        with _state_lock(blocking=False):
+        with _state_lock(timeout=CONTROL_WAIT_SECONDS):
             state = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {}
             if not isinstance(state, dict):
                 raise ValueError("watchdog state is not an object")
@@ -846,7 +863,7 @@ def fire() -> bool:
             result = state.get("last_recovery_result", {})
             return result.get("exit_code") == 0 and result.get("ready") is True
     except BlockingIOError:
-        print("Watchdog busy; no manual restart attempted.")
+        print(f"Watchdog busy after {CONTROL_WAIT_SECONDS}s; no manual restart attempted.")
         return False
     except (OSError, ValueError, TypeError, HTTPException) as error:
         print(f"Manual recovery failed: {type(error).__name__}", file=sys.stderr)

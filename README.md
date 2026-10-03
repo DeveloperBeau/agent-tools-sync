@@ -12,6 +12,8 @@ Rerun ATS to check installed tools, apply updates, and refresh agent integration
 - **ponytail:** lazy-coding plugin in both agents.
 - **Ship:** optional private plugin in both agents. ATS runs `ship-update` when installed or attempts installation through authenticated GitHub CLI. If access is unavailable, sync continues with the other tools.
 - **SkillOpt:** [Microsoft's skill optimizer](https://github.com/microsoft/SkillOpt), with the SkillOpt-Sleep plugin for Claude Code and skill for Codex CLI/Desktop. It runs on demand and stages learned changes for review.
+- **Context7:** [current library documentation](https://github.com/upstash/context7), registered as a remote HTTP MCP server for installed agents.
+- **Serena:** [semantic code navigation and editing](https://github.com/oraios/serena), installed through uv and registered as a local stdio MCP server for installed agents.
 - **Obsidian plans:** optional shared Markdown vault with plan capture and project indexes. Setup is off by default; enable it with `ATS_OBSIDIAN_PLANS=1`.
 
 Requests follow `agent → caveman (:8787) → headroom (:8788) → provider`. ATS configures a `compat.headroom` mount in `~/.caveman/caveman.yaml` and permits the loopback hop through `CAVE_SSRF_ALLOWLIST`.
@@ -67,7 +69,7 @@ Optional standalone watchdog records separate Claude and ChatGPT Codex route hea
 
 `ats kill` records stop intent in `~/.caveman/ats-stopped` before stopping services. The ATS-managed Caveman wrapper silently skips native hooks while stopped, and the watchdog honors the marker even before Headroom is unloaded. `ats start`, full `ats` sync, and `proxy-chain.sh start` clear the marker. Shutdown waits for in-progress watchdog work under the same control lock, then waits for identified Caveman listeners, escalates only those PIDs when needed, and preserves unknown processes. Lock acquisition waits up to three minutes. Failed shutdown or unavailable process inspection returns a failing command status.
 
-`ats watchdog fire` captures evidence before restarting Headroom, bypasses the automatic detection threshold and restart cooldown, and fails if restart or readiness fails. It preserves deliberate stop intent; run `ats start` first when stopped. Restart interrupts active proxy requests. Manual recovery shares a state lock with daemon polling. If an older watchdog is still running, reload its LaunchAgent using the installation command in [proxy recovery instructions](PROXY_RECOVERY.md) before using `fire`.
+`ats watchdog fire` captures evidence before restarting Headroom, bypasses the automatic detection threshold and restart cooldown, and fails if restart or readiness fails. It preserves deliberate stop intent; run `ats start` first when stopped. Restart interrupts active proxy requests. Manual recovery shares a state lock with daemon polling and shutdown. If busy, it reports the wait and allows up to three minutes for the current operation to finish, then reads fresh state and checks stop intent before recovery. A lock timeout fails without a restart. If an older watchdog is still running, reload its LaunchAgent using the installation command in [proxy recovery instructions](PROXY_RECOVERY.md) before using `fire`.
 
 If hooks report `Too many open files (os error 24)`, inspect the agent process rather than restarting proxies. Codex's shared daemon can exhaust its inherited descriptor limit, affecting skill scans and command spawning as well as hooks. See [descriptor troubleshooting](PROXY_RECOVERY.md#codex-hook-descriptor-exhaustion).
 
@@ -100,6 +102,35 @@ For Codex learning runs, select `--source codex` and a Codex-visible
 `--target-skill-path .agents/skills/<name>/SKILL.md`. The fork also supports
 `--target-document-path` for discovered guidance or stage prompts, and
 `--memory-path` for secondary guidance such as `CLAUDE.local.md` or `AGENTS.md`.
+
+## Context7 and Serena
+
+Full `ats` sync registers both MCP servers at user scope for whichever agents
+are installed. Existing entries named `context7` or `serena` are preserved,
+including custom endpoints, commands, API keys, and environment settings.
+ATS reads the user registries directly; it does not health-check or launch
+MCP servers while checking these registrations. Invalid or unreadable registries
+are preserved and reported. Registry inspection needs Python 3; Codex TOML
+inspection needs Python 3.11 or newer.
+
+Context7 uses `https://mcp.context7.com/mcp` without a local Node process.
+Anonymous access works without a key; configure authentication in your agent
+for higher limits if needed.
+
+ATS installs `serena-agent` with `uv tool install --python 3.13` and upgrades
+uv-managed installations on later syncs. Existing Serena executables outside
+that uv tool are preserved and used without replacement. Serena's configuration
+is initialized only when `serena_config.yml` is absent from `SERENA_HOME`
+(default `~/.serena`), preserving existing backend settings. ATS registers an
+absolute executable path, with `claude-code` or `codex` context and
+`--project-from-cwd`. Automatic browser opening is disabled.
+
+Start a new agent session after registration. Serena finds the nearest ancestor
+with `.serena/project.yml` or `.git` from the agent's working directory. If
+Codex Desktop starts elsewhere, ask: “Activate the current dir as project using
+serena.” Project configuration and language-server availability remain managed
+by Serena. These MCP sessions belong to the agents; `ats start`, `ats kill`,
+and the proxy watchdog do not manage them.
 
 ## Shared plans and Obsidian
 

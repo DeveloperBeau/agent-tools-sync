@@ -1,8 +1,8 @@
 diff --git a/docs/technical/proxy-reliability.md b/docs/technical/proxy-reliability.md
-index f0356f4..5656d28 100644
+index f0356f4..033a192 100644
 --- a/docs/technical/proxy-reliability.md
 +++ b/docs/technical/proxy-reliability.md
-@@ -87,9 +87,45 @@ client timeout remains active while reading the response body.
+@@ -87,9 +87,49 @@ client timeout remains active while reading the response body.
  There is no proxy session TTL. An idle HTTP keep-alive connection can still be
  closed and reopened normally; this is separate from listener or generation
  lifetime. TCP/TLS setup remains bounded, as do the wait for the first upstream
@@ -26,7 +26,11 @@ index f0356f4..5656d28 100644
 +large image/audio/video payloads can continue through the existing Headroom route.
 +It adds `x-headroom-bypass: true` after header sanitation so Headroom also skips
 +body processing. Routing, credentials, cancellation, the SSRF-guarded transport,
-+and inbound upload deadlines still apply. Other provider routes retain their
++and inbound upload deadlines still apply. Once a request enters the streamed
++Headroom path, its body-read deadline is extended to a bounded 15 minutes so
++upstream backpressure cannot trigger the general 30-second buffered-upload
++deadline. Header admission and other provider routes keep their existing limits.
++Other provider routes retain their
 +buffered behavior, including signing adapters that need the whole payload hash.
 +
 +Both limits accept positive decimal byte counts. Invalid or nonpositive values
@@ -53,10 +57,10 @@ index f0356f4..5656d28 100644
  provider credentials, provider context/rate limits, process termination, and
 diff --git a/proxy/internal/gateway/headroom_stream.go b/proxy/internal/gateway/headroom_stream.go
 new file mode 100644
-index 0000000..86c3c4d
+index 0000000..acca680
 --- /dev/null
 +++ b/proxy/internal/gateway/headroom_stream.go
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,187 @@
 +package gateway
 +
 +import (
@@ -127,6 +131,13 @@ index 0000000..86c3c4d
 +// never replay, including on a connection error or a provider rejection.
 +func (s *Server) streamHeadroomUpload(w http.ResponseWriter, r *http.Request, rc RequestContext, adapter providers.Adapter, credential providers.Credential, authMode AuthMode, source io.Reader, start time.Time, requestID, traceID string, transformLimit, requestLimit int64) {
 +	defer r.Body.Close()
++	// Streamed media can be backpressured while Headroom uploads upstream. The
++	// server's 30-second buffered-body deadline must not truncate that transfer.
++	// Keep a finite upload bound without changing other routes or header limits.
++	if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(15 * time.Minute)); err != nil && !errors.Is(err, http.ErrNotSupported) {
++		httpx.Error(w, r, http.StatusInternalServerError, "cave_request_read_failed", "Request upload deadline could not be set.")
++		return
++	}
 +	w.Header().Set("x-cave-bypass", "request_size")
 +	if s.logger != nil {
 +		s.logger.Info("large upload streams through Headroom without optimization", "event", "request_bypass",
@@ -239,13 +250,14 @@ index 0000000..86c3c4d
 +}
 diff --git a/proxy/internal/gateway/headroom_stream_test.go b/proxy/internal/gateway/headroom_stream_test.go
 new file mode 100644
-index 0000000..793a6fd
+index 0000000..0fbe0d3
 --- /dev/null
 +++ b/proxy/internal/gateway/headroom_stream_test.go
-@@ -0,0 +1,378 @@
+@@ -0,0 +1,472 @@
 +package gateway
 +
 +import (
++	"bufio"
 +	"bytes"
 +	"context"
 +	"crypto/sha256"
@@ -257,12 +269,105 @@ index 0000000..793a6fd
 +	"net/http/httptest"
 +	"strconv"
 +	"strings"
++	"sync"
 +	"testing"
 +	"testing/iotest"
++	"time"
 +
 +	"github.com/JuliusBrussee/caveman/proxy/providers"
 +	"github.com/JuliusBrussee/caveman/proxy/providers/openaicompat"
 +)
++
++type headroomPipeListener struct {
++	next   chan net.Conn
++	closed chan struct{}
++	once   sync.Once
++	addr   net.Addr
++}
++
++func (l *headroomPipeListener) Accept() (net.Conn, error) {
++	select {
++	case conn := <-l.next:
++		return conn, nil
++	case <-l.closed:
++		return nil, net.ErrClosed
++	}
++}
++
++func (l *headroomPipeListener) Close() error {
++	l.once.Do(func() { close(l.closed) })
++	return nil
++}
++
++func (l *headroomPipeListener) Addr() net.Addr { return l.addr }
++
++type delayedHeadroomBody struct {
++	reader io.Reader
++	delay  time.Duration
++}
++
++func (r *delayedHeadroomBody) Read(p []byte) (int, error) {
++	if r.delay > 0 {
++		time.Sleep(r.delay)
++		r.delay = 0
++	}
++	return r.reader.Read(p)
++}
++
++func TestHeadroomStreamUploadOutlivesDefaultReadDeadline(t *testing.T) {
++	t.Setenv("CAVE_MAX_TRANSFORM_BYTES", "32")
++	t.Setenv("CAVE_MAX_REQUEST_BYTES", "")
++	for _, known := range []bool{true, false} {
++		t.Run("known="+strconv.FormatBool(known), func(t *testing.T) {
++			body := bytes.Repeat([]byte("m"), 200)
++			upstreamBody := make(chan []byte, 1)
++			gateway := headroomStreamServer(t, "record", nil, roundTripFunc(func(r *http.Request) (*http.Response, error) {
++				got, err := io.ReadAll(r.Body)
++				if err != nil {
++					return nil, err
++				}
++				upstreamBody <- got
++				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok"))}, nil
++			}))
++			serverConn, clientConn := net.Pipe()
++			listener := &headroomPipeListener{next: make(chan net.Conn, 1), closed: make(chan struct{}), addr: serverConn.LocalAddr()}
++			listener.next <- serverConn
++			server := &http.Server{Handler: gateway.Handler(), ReadTimeout: 40 * time.Millisecond}
++			t.Cleanup(func() { server.Close() })
++			t.Cleanup(func() { clientConn.Close() })
++			go server.Serve(listener)
++			clientConn.SetDeadline(time.Now().Add(3 * time.Second))
++			// Send the detection prefix promptly, then model upload backpressure.
++			reader := io.MultiReader(bytes.NewReader(body[:40]), &delayedHeadroomBody{reader: bytes.NewReader(body[40:]), delay: 120 * time.Millisecond})
++			req, err := http.NewRequest(http.MethodPost, "http://caveman.test/compat/headroom/responses", reader)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if known {
++				req.ContentLength = int64(len(body))
++			} else {
++				req.ContentLength = -1
++			}
++			written := make(chan error, 1)
++			go func() { written <- req.Write(clientConn) }()
++			resp, err := http.ReadResponse(bufio.NewReader(clientConn), req)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer resp.Body.Close()
++			got, err := io.ReadAll(resp.Body)
++			if err != nil || resp.StatusCode != 200 || string(got) != "ok" {
++				t.Fatalf("upload hit default read deadline: status=%d body=%q error=%v", resp.StatusCode, got, err)
++			}
++			if err := <-written; err != nil {
++				t.Fatal(err)
++			}
++			if got := <-upstreamBody; !bytes.Equal(got, body) {
++				t.Fatalf("streamed body changed: received %d bytes", len(got))
++			}
++		})
++	}
++}
 +
 +type uninspectedHeadroomAdapter struct{ providers.Adapter }
 +
@@ -927,9 +1032,10 @@ index 98bf7e9..47e6720 100644
  const requestAccountingMaxBytes = 4 << 20
  
 diff --git a/proxy/internal/nativehook/hook.go b/proxy/internal/nativehook/hook.go
+index 4b5c552..9ae507a 100644
 --- a/proxy/internal/nativehook/hook.go
 +++ b/proxy/internal/nativehook/hook.go
-@@ -37,7 +37,7 @@
+@@ -37,7 +37,7 @@ func Run(ctx context.Context, home, agent, adapterPath string, raw []byte, stdou
  	}
  	eventName := normalizeEvent(agent, firstString(event, "hook_event_name", "event_name", "event"))
  	if eventName != "PreToolUse" && eventName != "PermissionRequest" {
@@ -938,7 +1044,7 @@ diff --git a/proxy/internal/nativehook/hook.go b/proxy/internal/nativehook/hook.
  		return nil
  	}
  	sessionID := bounded(firstString(event, "session_id", "sessionId"), 160)
-@@ -381,7 +381,7 @@
+@@ -381,7 +381,7 @@ func recordFallback(home, agent, eventName, sessionID, toolName string, raw []by
  	_ = os.Chmod(path, 0o600)
  }
  
@@ -947,7 +1053,7 @@ diff --git a/proxy/internal/nativehook/hook.go b/proxy/internal/nativehook/hook.
  	if adapterPath == "" {
  		return
  	}
-@@ -397,7 +397,23 @@
+@@ -397,7 +397,23 @@ func delegate(ctx context.Context, adapterPath, agent string, raw []byte, stdout
  	if cmd.Run() != nil {
  		return
  	}
@@ -974,6 +1080,7 @@ diff --git a/proxy/internal/nativehook/hook.go b/proxy/internal/nativehook/hook.
  
 diff --git a/proxy/internal/nativehook/hook_codex_output_test.go b/proxy/internal/nativehook/hook_codex_output_test.go
 new file mode 100644
+index 0000000..d140b1f
 --- /dev/null
 +++ b/proxy/internal/nativehook/hook_codex_output_test.go
 @@ -0,0 +1,97 @@

@@ -48,6 +48,12 @@ source "$SCRIPT_DIR/lib/claude-mem.sh"
 source "$SCRIPT_DIR/lib/ship.sh"
 # shellcheck source=lib/skillopt.sh
 source "$SCRIPT_DIR/lib/skillopt.sh"
+# shellcheck source=lib/mcp.sh
+source "$SCRIPT_DIR/lib/mcp.sh"
+# shellcheck source=lib/context7.sh
+source "$SCRIPT_DIR/lib/context7.sh"
+# shellcheck source=lib/serena.sh
+source "$SCRIPT_DIR/lib/serena.sh"
 # shellcheck source=lib/obsidian.sh
 source "$SCRIPT_DIR/lib/obsidian.sh"
 
@@ -114,6 +120,8 @@ main() {
   setup_claude_mem
   setup_ship
   setup_skillopt
+  setup_context7
+  setup_serena
   setup_obsidian
   bash "$SCRIPT_DIR/proxy-chain.sh" start || return 1
   section "done"
@@ -125,6 +133,8 @@ main() {
   echo "  claude-mem → cross-session memory plugin in both, worker daemon on its own port"
   echo "  ship       → optional private plugin in both agents"
   echo "  skillopt   → skill optimization CLI, Claude plugin, and Codex skill"
+  echo "  context7   → remote documentation MCP for installed agents"
+  echo "  serena     → project code navigation MCP for installed agents"
   if obsidian_enabled; then
     echo "  plans      → shared Obsidian vault, automatic Claude and Codex plan capture"
   fi
