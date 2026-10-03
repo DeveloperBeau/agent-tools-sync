@@ -978,6 +978,25 @@ def _watch() -> None:
         time.sleep(POLL_SECONDS)
 
 
+def _launchctl(arguments: list[str]):
+    try:
+        return subprocess.run(["launchctl", *arguments], capture_output=True, text=True,
+                              timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise SystemExit(f"Watchdog {arguments[0]} failed: {type(error).__name__}") from None
+
+
+def _install_failure(action: str, result) -> None:
+    detail = " ".join(line.strip() for line in (result.stderr or result.stdout or "").splitlines()
+                      if line.strip() and "re-running the command as root" not in line)
+    raise SystemExit(
+        f"Watchdog {action} failed (exit {result.returncode}): {detail or 'no native diagnostic'}\n"
+        "Inspect user launchd logs from Terminal:\n"
+        "/usr/bin/log show --last 20m --style compact --predicate "
+        f"'process == \"launchd\" AND eventMessage CONTAINS \"{LABEL}\"'"
+    )
+
+
 def install() -> None:
     os.umask(0o077)
     launch_agents = Path.home() / "Library/LaunchAgents"
@@ -998,8 +1017,16 @@ def install() -> None:
             output,
         )
     domain = f"gui/{os.getuid()}"
-    subprocess.run(["launchctl", "bootout", f"{domain}/{LABEL}"], capture_output=True, check=False)
-    subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], check=True)
+    unloaded = _launchctl(["bootout", f"{domain}/{LABEL}"])
+    if unloaded.returncode != 0:
+        # An absent service is normal on first install. Other unload failures
+        # must not be hidden by attempting another registration over it.
+        status = _launchctl(["print", f"{domain}/{LABEL}"])
+        if status.returncode != 113:
+            _install_failure("unload", unloaded)
+    loaded = _launchctl(["bootstrap", domain, str(plist_path)])
+    if loaded.returncode != 0:
+        _install_failure("bootstrap", loaded)
     print(f"Installed {LABEL} from {Path(__file__).resolve()}")
 
 

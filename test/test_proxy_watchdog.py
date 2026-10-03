@@ -8,6 +8,7 @@ import json
 import plistlib
 import tempfile
 import struct
+import subprocess
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -1019,13 +1020,72 @@ class RecoveryDecisionTests(unittest.TestCase):
             with patch.object(watchdog.Path, "home", return_value=root), \
                  patch.object(watchdog, "HEADROOM", root / ".headroom"), \
                  patch.object(watchdog.os, "umask"), \
-                 patch.object(watchdog.subprocess, "run") as run:
+                 patch.object(watchdog.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
                 watchdog.install()
             with (agents / f"{watchdog.LABEL}.plist").open("rb") as source:
                 self.assertEqual(plistlib.load(source)["Label"], "au.com.beauayres.agent-tools-sync.proxy-watchdog")
             calls = [call.args[0] for call in run.call_args_list]
             self.assertTrue(calls[0][-1].endswith("/au.com.beauayres.agent-tools-sync.proxy-watchdog"))
             self.assertEqual(calls[-1][1], "bootstrap")
+
+    def test_install_bootstrap_failure_reports_native_error_without_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            def run(command, **kwargs):
+                code = 5 if command[1] == "bootstrap" else 0
+                error = "Bootstrap failed: 5: Input/output error\nTry re-running the command as root for richer errors."
+                if code and kwargs.get("check"):
+                    raise subprocess.CalledProcessError(code, command, stderr=error)
+                return subprocess.CompletedProcess(command, code, "", error if code else "")
+            with patch.object(watchdog.Path, "home", return_value=root), \
+                 patch.object(watchdog, "HEADROOM", root / ".headroom"), \
+                 patch.object(watchdog.subprocess, "run", side_effect=run):
+                with self.assertRaises(SystemExit) as failure:
+                    watchdog.install()
+            message = str(failure.exception)
+            self.assertIn("Input/output error", message)
+            self.assertIn("log show", message)
+            self.assertNotIn("as root", message)
+
+    def test_install_failed_unload_does_not_bootstrap_over_loaded_service(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            calls = []
+            def run(command, **kwargs):
+                calls.append(command[1])
+                return subprocess.CompletedProcess(command, 1 if command[1] == "bootout" else 0, "", "unload refused")
+            with patch.object(watchdog.Path, "home", return_value=root), \
+                 patch.object(watchdog, "HEADROOM", root / ".headroom"), \
+                 patch.object(watchdog.subprocess, "run", side_effect=run):
+                with self.assertRaises(SystemExit):
+                    watchdog.install()
+            self.assertNotIn("bootstrap", calls)
+
+    def test_install_absent_service_can_bootstrap_after_confirmed_missing_registration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            calls = []
+            def run(command, **kwargs):
+                calls.append(command[1])
+                code = {"bootout": 3, "print": 113, "bootstrap": 0}[command[1]]
+                return subprocess.CompletedProcess(command, code, "", "")
+            with patch.object(watchdog.Path, "home", return_value=root), \
+                 patch.object(watchdog, "HEADROOM", root / ".headroom"), \
+                 patch.object(watchdog.subprocess, "run", side_effect=run):
+                watchdog.install()
+            self.assertEqual(calls, ["bootout", "print", "bootstrap"])
+
+    def test_install_timeout_reports_failed_action_without_bootstrap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            with patch.object(watchdog.Path, "home", return_value=root), \
+                 patch.object(watchdog, "HEADROOM", root / ".headroom"), \
+                 patch.object(watchdog.subprocess, "run", side_effect=subprocess.TimeoutExpired("launchctl", 10)) as run:
+                with self.assertRaises(SystemExit) as failure:
+                    watchdog.install()
+            self.assertIn("bootout failed: TimeoutExpired", str(failure.exception))
+            run.assert_called_once()
+            self.assertEqual(run.call_args.kwargs["timeout"], 10)
 
     def test_three_unresponsive_health_probes_trigger_recovery(self):
         with tempfile.TemporaryDirectory() as directory:
