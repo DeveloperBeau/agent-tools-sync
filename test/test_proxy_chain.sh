@@ -6,6 +6,7 @@ source "$HERE/../proxy-chain.sh"
 
 startup_check() (
   scenario="$1" expected="$2" order="" hr=0 cave=0
+  proxy_resume() { :; }
   [ "$scenario" = healthy ] && { hr=1; cave=1; }
   caveman_yaml_has_headroom_stack() { [ "$scenario" != invalid ]; }
   chain_ready() { if [ "$2" = headroom ]; then [ "$hr" = 1 ]; else [ "$cave" = 1 ]; fi; }

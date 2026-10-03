@@ -30,6 +30,8 @@ caveman_restart_check() (
   caveman() { [ "$1" = --version ] && printf '%s\n' "$version"; }
   install_caveman() { version="$target_version"; }
   pgrep() { [ "$running" -eq 1 ]; }
+  port_listening() { [ "$running" -eq 1 ]; }
+  caveman_listener_owned() { [ "$running" -eq 1 ]; }
   caveman_stop_proxy() { order="${order}S"; running=0; }
   caveman_start_proxy() { order="${order}B"; running=1; }
   sleep() { :; }

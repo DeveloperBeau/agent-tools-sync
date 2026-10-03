@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 from collections import deque
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.client import HTTPException
 from pathlib import Path
@@ -667,6 +668,8 @@ def _persist_first_faults(snapshot: dict, state: dict, now: float) -> dict | Non
 
 
 def _managed_headroom_loaded() -> bool:
+    if (Path(os.environ.get("CAVEMAN_HOME", str(Path.home() / ".caveman"))) / "ats-stopped").exists():
+        return False
     try:
         result = subprocess.run(
             ["launchctl", "print", f"gui/{os.getuid()}/com.headroom.default"],
@@ -747,7 +750,7 @@ def _report_cooldown_failure(route: str, routes: dict, state: dict, now: float, 
                       "route": route, **suppression, "incident": str(report_path)}), flush=True)
 
 
-def recover(route: str, routes: dict, state: dict, now: float) -> bool:
+def recover(route: str, routes: dict, state: dict, now: float, *, force=False) -> bool:
     # A deliberately unloaded service must stay stopped. KeepAlive handles
     # crashes; a loaded but unresponsive service still needs recovery.
     if not _managed_headroom_loaded():
@@ -756,11 +759,21 @@ def recover(route: str, routes: dict, state: dict, now: float) -> bool:
         return False
     last_attempt = state.get("last_attempt", 0)
     remaining = max(0, math.ceil(last_attempt + COOLDOWN_SECONDS - now)) if last_attempt else 0
-    if remaining:
+    if remaining and not force:
         _report_cooldown_failure(route, routes, state, now, remaining)
         return False
     incident_path, incident = _capture_incident(route, routes, state)
     incident["restart_decision"] = _restart_decision(route, incident, "restart")
+    if force:
+        incident["restart_decision"]["forced"] = True
+    # Stop intent can arrive while bounded evidence probes are running. ATS
+    # shutdown holds the same control lock until all services are stopped.
+    if not _managed_headroom_loaded():
+        incident["restart_decision"]["decision"] = "service_deliberately_unloaded"
+        report_path = _save_incident(incident_path, incident, state)
+        state.update(restart_decision=incident["restart_decision"], incident=str(report_path))
+        _save_json(STATE_PATH, state)
+        return False
     report_path = _save_incident(incident_path, incident, state)
     _link_first_faults(incident, state, report_path)
     updated_path = _save_incident(incident_path, incident, state)
@@ -782,16 +795,62 @@ def recover(route: str, routes: dict, state: dict, now: float) -> bool:
         _link_first_faults(incident, state, report_path)
         _save_incident(incident_path, incident, state)
     state["incident"] = str(report_path)
+    state["last_recovery_result"] = {"exit_code": incident["restart"]["exit_code"],
+                                     "ready": incident["ready_after_restart"]}
     _save_json(STATE_PATH, state)
     restarted = incident["restart"]["exit_code"] == 0 and incident["ready_after_restart"]
+    trigger = "Manual recovery" if route == "manual" else f"{route} failure"
     message = (
-        f"{route} failure; Headroom restarted. API recovery awaits real traffic."
+        f"{trigger}; Headroom restarted. API recovery awaits real traffic."
         if restarted
-        else f"{route} failure; Headroom recovery failed. See incident report."
+        else f"{trigger}; Headroom recovery failed. See incident report."
     )
     _notify(message)
     print(f"{datetime.now(timezone.utc).isoformat()} {message} {report_path}", flush=True)
     return True
+
+
+@contextmanager
+def _state_lock(*, blocking=True):
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with STATE_PATH.with_suffix(".control.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        yield
+
+
+def _watch_running() -> bool:
+    with STATE_PATH.with_suffix(".lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+    return False
+
+
+def fire() -> bool:
+    """Force a recovery attempt while retaining stop intent and writer ownership."""
+    os.umask(0o077)
+    try:
+        with _state_lock(blocking=False):
+            state = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {}
+            if not isinstance(state, dict):
+                raise ValueError("watchdog state is not an object")
+            if _watch_running() and state.get("control_schema") != 1:
+                print("Running watchdog lacks manual control; reload its LaunchAgent first.")
+                return False
+            attempted = recover("manual", _snapshot(ROUTE_URL), state, time.time(), force=True)
+            _save_json(STATE_PATH, state)
+            if not attempted:
+                print("Proxy deliberately stopped; run ats start before recovery.")
+                return False
+            result = state.get("last_recovery_result", {})
+            return result.get("exit_code") == 0 and result.get("ready") is True
+    except BlockingIOError:
+        print("Watchdog busy; no manual restart attempted.")
+        return False
+    except (OSError, ValueError, TypeError, HTTPException) as error:
+        print(f"Manual recovery failed: {type(error).__name__}", file=sys.stderr)
+        return False
 
 
 def _link_first_faults(incident: dict, state: dict, report_path: Path) -> None:
@@ -875,40 +934,42 @@ def _watch() -> None:
     probe_failures = 0
     while True:
         try:
-            state = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {}
-            now = time.time()
-            _sample_diagnostics(state, now)
-            _save_json(STATE_PATH, state)
-            if now - state.get("last_sample", 0) >= SAMPLE_SECONDS:
-                _sample_host_context(state, now)
-                samples = (state.get("memory_samples") or [])[-SAMPLE_LIMIT + 1 :]
-                samples.append({
-                    "time": datetime.now(timezone.utc).isoformat(),
-                    "caveman_8787": _listener_memory(8787),
-                    "headroom_8788": _listener_memory(8788),
-                })
-                state["memory_samples"] = samples
-                state["last_sample"] = now
+            with _state_lock():
+                state = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {}
+                state["control_schema"] = 1
+                now = time.time()
+                _sample_diagnostics(state, now)
                 _save_json(STATE_PATH, state)
-            try:
-                routes = _metadata(_get_json(ROUTE_URL))
-            except (OSError, ValueError, HTTPException) as error:
-                probe_failures += 1
-                if probe_failures >= 3:
-                    recover("headroom_health_endpoint", {"probe_error": type(error).__name__}, state, now)
+                if now - state.get("last_sample", 0) >= SAMPLE_SECONDS:
+                    _sample_host_context(state, now)
+                    samples = (state.get("memory_samples") or [])[-SAMPLE_LIMIT + 1 :]
+                    samples.append({
+                        "time": datetime.now(timezone.utc).isoformat(),
+                        "caveman_8787": _listener_memory(8787),
+                        "headroom_8788": _listener_memory(8788),
+                    })
+                    state["memory_samples"] = samples
+                    state["last_sample"] = now
                     _save_json(STATE_PATH, state)
-                    probe_failures = 0
-                raise
-            probe_failures = 0
-            last_error = None
-            state["last_routes"] = routes
-            state["last_poll"] = datetime.now(timezone.utc).isoformat()
-            _save_json(STATE_PATH, state)
-            for route in recovery_candidates(routes):
-                if recover(route, routes, state, now):
-                    # A restart invalidates this snapshot of both routes.
-                    break
-            _save_json(STATE_PATH, state)
+                try:
+                    routes = _metadata(_get_json(ROUTE_URL))
+                except (OSError, ValueError, HTTPException) as error:
+                    probe_failures += 1
+                    if probe_failures >= 3:
+                        recover("headroom_health_endpoint", {"probe_error": type(error).__name__}, state, now)
+                        _save_json(STATE_PATH, state)
+                        probe_failures = 0
+                    raise
+                probe_failures = 0
+                last_error = None
+                state["last_routes"] = routes
+                state["last_poll"] = datetime.now(timezone.utc).isoformat()
+                _save_json(STATE_PATH, state)
+                for route in recovery_candidates(routes):
+                    if recover(route, routes, state, now):
+                        # A restart invalidates this snapshot of both routes.
+                        break
+                _save_json(STATE_PATH, state)
         except (OSError, ValueError, TypeError, HTTPException) as error:
             message = type(error).__name__
             if message != last_error:
@@ -948,6 +1009,11 @@ if __name__ == "__main__":
     elif sys.argv[1:] == ["install"]:
         install()
     elif sys.argv[1:] == ["capture"]:
-        capture()
+        try:
+            capture()
+        except (OSError, ValueError, TypeError, HTTPException) as error:
+            raise SystemExit(f"Manual capture failed: {type(error).__name__}")
+    elif sys.argv[1:] == ["fire"]:
+        raise SystemExit(0 if fire() else 1)
     else:
-        raise SystemExit("usage: proxy_watchdog.py [watch|install|capture]")
+        raise SystemExit("usage: proxy_watchdog.py [watch|install|capture|fire]")

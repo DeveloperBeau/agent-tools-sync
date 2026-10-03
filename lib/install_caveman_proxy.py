@@ -24,6 +24,12 @@ case ",${CAVE_SSRF_ALLOWLIST:-}," in
   *) CAVE_SSRF_ALLOWLIST="${CAVE_SSRF_ALLOWLIST:+$CAVE_SSRF_ALLOWLIST,}127.0.0.1:8788" ;;
 esac
 export CAVE_SSRF_ALLOWLIST
+if [ -e "${CAVEMAN_HOME:-$HOME/.caveman}/ats-stopped" ]; then
+  case "${1:-serve}" in
+    native-hook) exit 0 ;;
+    serve) echo "ATS proxies deliberately stopped; run ats start." >&2; exit 1 ;;
+  esac
+fi
 if [ "$#" -eq 0 ] || [ "$1" = serve ]; then
   caveman_log="${CAVEMAN_HOME:-$HOME/.caveman}/proxy.log"
   mkdir -p "$(dirname -- "$caveman_log")" || exit 1
@@ -55,8 +61,13 @@ def install(source=None):
         try:
             previous = json.loads(receipt.read_text())
             current = {**wanted, "binary_sha256": digest(binary)}
-            if (previous == current and os.access(binary, os.X_OK)
-                    and os.access(wrapper, os.X_OK) and wrapper.read_text() == WRAPPER):
+            if previous == current and os.access(binary, os.X_OK):
+                if not (os.access(wrapper, os.X_OK) and wrapper.read_text() == WRAPPER):
+                    with tempfile.TemporaryDirectory(prefix=".wrapper-", dir=ROOT) as temporary:
+                        staged = Path(temporary) / "caveman-proxy"
+                        staged.write_text(WRAPPER)
+                        staged.chmod(0o755)
+                        staged.replace(wrapper)
                 print(f"Patched Caveman already installed: {wrapper}")
                 return
         except (OSError, ValueError):

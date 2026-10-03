@@ -25,7 +25,7 @@ unset _src _dir
 
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
-if [ "${1:-}" != kill ] && [ "${1:-}" != start ]; then
+if [ "${1:-}" != kill ] && [ "${1:-}" != start ] && [ "${1:-}" != watchdog ]; then
   if ats_check_update "$SCRIPT_DIR"; then
     :
   elif [ "$?" -eq 2 ]; then
@@ -61,15 +61,27 @@ HEADROOM_PORT="${HEADROOM_PORT:-8788}"
 # fixed-port proxy is still listening.
 cmd_kill() {
   section "kill"
-  caveman_stop_proxy
-  headroom_stop_proxy
-  claude_mem_stop_worker
+  proxy_suspend || return 1
+  proxy_control_run cmd_kill_services
+}
+
+cmd_kill_services() {
+  local failed=0
+  caveman_stop_proxy || failed=1
+  headroom_stop_proxy || failed=1
+  claude_mem_stop_worker || failed=1
 
   sleep 1  # give the sockets a moment to actually release
-  local alive=0
-  port_listening 8787 && { warn "port 8787 still listening"; alive=1; }
-  port_listening "$HEADROOM_PORT" && { warn "port $HEADROOM_PORT still listening"; alive=1; }
-  [ "$alive" -eq 0 ] && ok "no agent-tools servers listening on 8787 or $HEADROOM_PORT"
+  local alive=0 port
+  for port in 8787 "$HEADROOM_PORT"; do
+    if port_listening "$port"; then
+      warn "port $port still listening"; alive=1
+    elif [ "$?" != 1 ]; then
+      warn "cannot inspect port $port"; alive=1
+    fi
+  done
+  if [ "$alive" -eq 0 ]; then ok "no agent-tools servers listening on 8787 or $HEADROOM_PORT"; fi
+  [ "$alive" -eq 0 ] && [ "$failed" -eq 0 ]
 }
 
 # cmd_start — brings all background servers back up without the full
@@ -84,10 +96,16 @@ main() {
   case "${1:-}" in
     kill) cmd_kill; return ;;
     start) cmd_start; return ;;
+    watchdog)
+      case "${2:-}" in
+        capture|fire) [ "$#" -eq 2 ] || return 1; python3 "$SCRIPT_DIR/lib/proxy_watchdog.py" "$2"; return ;;
+        *) echo "usage: ats watchdog [capture|fire]" >&2; return 1 ;;
+      esac ;;
     "") ;;
-    *) echo "usage: agent-tools-sync [kill|start]" >&2; return 1 ;;
+    *) echo "usage: agent-tools-sync [kill|start|watchdog capture|watchdog fire]" >&2; return 1 ;;
   esac
 
+  proxy_resume || return 1
   setup_headroom
   setup_rtk
   setup_caveman
@@ -97,6 +115,7 @@ main() {
   setup_ship
   setup_skillopt
   setup_obsidian
+  bash "$SCRIPT_DIR/proxy-chain.sh" start || return 1
   section "done"
   echo "  caveman    → both agents' base URL, proxy on :8787, chains to headroom"
   echo "  headroom   → downstream compression hop on :$HEADROOM_PORT, on-demand MCP in Claude Code"

@@ -78,10 +78,7 @@ PY
         return 0
       fi ;;
     match)
-      if ! run with_timeout 120 claude plugin marketplace update skillopt-sleep; then
-        warn "Claude Code SkillOpt marketplace update failed; continuing"
-        return 0
-      fi ;;
+      skip "Claude Code SkillOpt uses refreshed local marketplace" ;;
     *) warn "Claude Code SkillOpt marketplace has another source or invalid registry; preserved"; return 0 ;;
   esac
   installed="$(python3 - "$config_dir/plugins/installed_plugins.json" <<'PY'

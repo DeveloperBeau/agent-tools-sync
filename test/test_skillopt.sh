@@ -105,7 +105,7 @@ skillopt_initial_and_rerun() (
   [ -s "$skill" ] || return 1
   grep -q 'claude plugin install skillopt-sleep@skillopt-sleep --scope user' "$SKILLOPT_TEST_ROOT/calls" || return 1
   setup_skillopt >/dev/null || return 1
-  grep -q 'claude plugin marketplace update skillopt-sleep' "$SKILLOPT_TEST_ROOT/calls" || return 1
+  ! grep -q 'claude plugin marketplace update skillopt-sleep' "$SKILLOPT_TEST_ROOT/calls" || return 1
   grep -q 'claude plugin update skillopt-sleep@skillopt-sleep --scope user' "$SKILLOPT_TEST_ROOT/calls" || return 1
   [ "$(find "$(dirname "$skill")" -name 'SKILL.md.backup-*' | wc -l | tr -d ' ')" = 0 ] || return 1
   [ "$(grep -c '^git clone ' "$SKILLOPT_TEST_ROOT/calls")" = 1 ]

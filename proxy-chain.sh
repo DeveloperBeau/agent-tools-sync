@@ -38,6 +38,7 @@ chain_wait() {
 
 chain_start() {
   local allowlist
+  proxy_resume || return 1
   # This launcher deliberately uses the already-installed, fixed-port mount.
   # Do not run setup_headroom: it may replace the diagnostic fork or deployment.
   caveman_yaml_has_headroom_stack "$(cat "$CAVEMAN_CONFIG_FILE" 2>/dev/null)" || {
@@ -45,8 +46,12 @@ chain_start() {
     return 1
   }
   if ! chain_ready http://127.0.0.1:8788/health headroom; then
-    if ! port_listening 8788; then
+    if port_listening 8788; then
+      :
+    elif [ "$?" = 1 ]; then
       headroom install start --profile default || return 1
+    else
+      warn "cannot inspect port 8788"; return 1
     fi
     chain_wait http://127.0.0.1:8788/health headroom || return 1
   fi
@@ -59,8 +64,12 @@ chain_start() {
   esac
   export CAVE_SSRF_ALLOWLIST="$allowlist"
   if ! chain_ready http://127.0.0.1:8787/ caveman; then
-    if ! port_listening 8787; then
+    if port_listening 8787; then
+      :
+    elif [ "$?" = 1 ]; then
       caveman_start_proxy || return 1
+    else
+      warn "cannot inspect port 8787"; return 1
     fi
     chain_wait http://127.0.0.1:8787/ caveman || return 1
   fi

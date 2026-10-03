@@ -217,7 +217,8 @@ PY
   printf '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"/user/custom-proxy native-hook codex"}]}]}}' > "$CAVEMAN_CODEX_HOOKS"
   caveman_ensure_agent $'codex installed' codex Codex >/dev/null
   [ -z "$enabled" ] || return 1
-  pgrep() { probes=$((probes + 1)); [ "$probes" -gt 1 ]; }
+  lsof() { [ -f "$CAVEMAN_PROXY_LOG" ] && printf '123\n'; }
+  ps() { printf '%s.bin\n' "$CAVEMAN_PRIVATE_PROXY_BIN"; }
   nohup() { printf 'caveman bypass diagnostic\n'; }
   sleep() { wait; }
   caveman_start_proxy >/dev/null

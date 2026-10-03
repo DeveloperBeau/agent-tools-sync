@@ -1,4 +1,5 @@
 import importlib.util
+import fcntl
 import ctypes
 import ctypes.util
 import io
@@ -31,6 +32,124 @@ def route(state, reason, age=1):
 
 
 class RecoveryDecisionTests(unittest.TestCase):
+    def test_stop_requested_during_capture_prevents_restart_and_preserves_cooldown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            state = {"last_attempt": 100, "operator_setting": "keep"}
+            with patch.multiple(watchdog, STATE_PATH=root / "state.json", INCIDENTS=root / "incidents"), \
+                 patch.object(watchdog, "_managed_headroom_loaded", side_effect=[True, False]), \
+                 patch.object(watchdog, "_snapshot", return_value={"ready": True}), \
+                 patch.object(watchdog, "_listener_memory", return_value=None), \
+                 patch.object(watchdog, "_safe_log_tail", return_value=[]), \
+                 patch.object(watchdog, "_safe_caveman_tail", return_value=[]), \
+                 patch.object(watchdog, "_restart_headroom") as restart, \
+                 patch.object(watchdog, "_notify"):
+                self.assertFalse(watchdog.recover("manual", {}, state, 10000, force=True))
+                restart.assert_not_called()
+            self.assertEqual(state["last_attempt"], 100)
+            self.assertEqual(state["operator_setting"], "keep")
+            incident = json.loads(next((root / "incidents").glob("*-manual.json")).read_text())
+            self.assertEqual(incident["restart_decision"]["decision"], "service_deliberately_unloaded")
+
+    def test_manual_fire_refuses_old_running_watcher_without_state_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            state_path = root / "state.json"
+            original = '{"last_attempt":9500,"operator_setting":"keep"}'
+            state_path.write_text(original)
+            with state_path.with_suffix(".lock").open("a") as lock, \
+                 patch.multiple(watchdog, STATE_PATH=state_path, INCIDENTS=root / "incidents"), \
+                 patch.object(watchdog, "_restart_headroom") as restart, \
+                 patch.object(watchdog, "_snapshot") as snapshot:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with redirect_stdout(io.StringIO()) as output:
+                    self.assertFalse(watchdog.fire())
+                self.assertIn("reload", output.getvalue())
+                self.assertEqual(state_path.read_text(), original)
+                restart.assert_not_called()
+                snapshot.assert_not_called()
+
+    def test_poll_owns_control_lock_through_diagnostic_sampling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            def sample(state, now):
+                with self.assertRaises(BlockingIOError):
+                    with watchdog._state_lock(blocking=False):
+                        pass
+                self.assertEqual(state["control_schema"], 1)
+                raise KeyboardInterrupt
+            with patch.object(watchdog, "STATE_PATH", root / "state.json"), \
+                 patch.object(watchdog, "_sample_diagnostics", side_effect=sample):
+                with self.assertRaises(KeyboardInterrupt):
+                    watchdog._watch()
+                with watchdog._state_lock(blocking=False):
+                    pass
+
+    def test_stop_marker_blocks_loaded_service_without_launchctl_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (pathlib.Path(directory) / "ats-stopped").touch()
+            with patch.dict(watchdog.os.environ, {"CAVEMAN_HOME": directory}), \
+                 patch.object(watchdog.subprocess, "run") as run:
+                self.assertFalse(watchdog._managed_headroom_loaded())
+                run.assert_not_called()
+
+    def test_manual_fire_returns_failure_for_failed_restart_or_missing_readiness(self):
+        for exit_code, ready in [(1, True), (0, False)]:
+            with self.subTest(exit_code=exit_code, ready=ready), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                state_path = root / "state.json"
+                with patch.multiple(watchdog, STATE_PATH=state_path, INCIDENTS=root / "incidents"), \
+                     patch.object(watchdog, "_managed_headroom_loaded", return_value=True), \
+                     patch.object(watchdog, "_snapshot", return_value={"ready": True}), \
+                     patch.object(watchdog, "_listener_memory", return_value=None), \
+                     patch.object(watchdog, "_safe_log_tail", return_value=[]), \
+                     patch.object(watchdog, "_safe_caveman_tail", return_value=[]), \
+                     patch.object(watchdog, "_restart_headroom", return_value={"exit_code": exit_code}), \
+                     patch.object(watchdog, "_ready_after_restart", return_value=ready), \
+                     patch.object(watchdog, "_restart_aftermath", return_value={}), \
+                     patch.object(watchdog, "_notify"), redirect_stdout(io.StringIO()):
+                    self.assertFalse(watchdog.fire())
+                stored = json.loads(state_path.read_text())
+                self.assertEqual(stored["last_recovery_result"], {"exit_code": exit_code, "ready": ready})
+                self.assertIn("incident", stored)
+
+    def test_manual_fire_bypasses_detection_and_cooldown_with_saved_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            state_path = root / "state.json"
+            state_path.write_text(json.dumps({"last_attempt": 9999, "operator_setting": "keep"}))
+            def restart():
+                state = json.loads(state_path.read_text())
+                incident = json.loads(pathlib.Path(state["incident"]).read_text())
+                self.assertEqual(incident["restart_decision"]["trigger"], "manual")
+                self.assertTrue(incident["restart_decision"]["forced"])
+                self.assertEqual(state["operator_setting"], "keep")
+                return {"exit_code": 0}
+            with patch.multiple(watchdog, STATE_PATH=state_path, INCIDENTS=root / "incidents"), \
+                 patch.object(watchdog, "_managed_headroom_loaded", return_value=True), \
+                 patch.object(watchdog, "_snapshot", return_value={"ready": True}), \
+                 patch.object(watchdog, "_listener_memory", return_value=None), \
+                 patch.object(watchdog, "_safe_log_tail", return_value=[]), \
+                 patch.object(watchdog, "_safe_caveman_tail", return_value=[]), \
+                 patch.object(watchdog, "_restart_headroom", side_effect=restart) as run, \
+                 patch.object(watchdog, "_ready_after_restart", return_value=True), \
+                 patch.object(watchdog, "_restart_aftermath", return_value={}), \
+                 patch.object(watchdog, "_notify"), patch.object(watchdog.time, "time", return_value=10000):
+                self.assertTrue(watchdog.fire())
+                run.assert_called_once()
+
+    def test_manual_fire_is_busy_when_poll_owns_state_and_never_restarts_stopped_service(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            with patch.multiple(watchdog, STATE_PATH=root / "state.json", INCIDENTS=root / "incidents"), \
+                 patch.object(watchdog, "_managed_headroom_loaded", return_value=False), \
+                 patch.object(watchdog, "_restart_headroom") as restart, \
+                 patch.object(watchdog, "_notify"):
+                with watchdog._state_lock():
+                    self.assertFalse(watchdog.fire())
+                self.assertFalse(watchdog.fire())
+                restart.assert_not_called()
+
     def setUp(self):
         if self._testMethodName not in {"test_host_snapshot_parses_only_route_addresses_and_numeric_counters",
                                        "test_packet_probe_failures_and_unsupported_host_do_not_expose_error_text"}:

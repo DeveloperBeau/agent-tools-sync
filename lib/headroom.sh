@@ -289,13 +289,31 @@ headroom_ensure_proxy() {
 # No-op (skip) if headroom isn't installed or the profile isn't running.
 headroom_stop_proxy() {
   have headroom || { skip "headroom not installed"; return; }
-  local status
-  status="$(headroom install status --profile default 2>&1)"
-  if headroom_profile_running "$status"; then
-    if run headroom install stop --profile default; then
-      ok "proxy stopped"
+  local status result
+  status="$(with_timeout 30 headroom install status --profile default 2>&1)"; result=$?
+  case "$status" in *"No deployment profile named"*) skip "proxy not running"; return 0 ;; esac
+  if [ "$result" != 0 ] || ! headroom_profile_exists "$status"; then
+    warn "cannot inspect Headroom deployment"
+    return 1
+  fi
+  if headroom_profile_exists "$status"; then
+    if run with_timeout 30 headroom install stop --profile default; then
+      local attempt
+      for attempt in {1..15}; do
+        if port_listening "${HEADROOM_PORT:-8788}"; then
+          :
+        elif [ "$?" = 1 ]; then
+          ok "proxy stopped"; return 0
+        else
+          warn "cannot verify Headroom listener shutdown"; return 1
+        fi
+        sleep 1
+      done
+      warn "Headroom stop returned but port ${HEADROOM_PORT:-8788} still listening"
+      return 1
     else
       warn "proxy stop failed — check 'headroom install status --profile default'"
+      return 1
     fi
   else
     skip "proxy not running"

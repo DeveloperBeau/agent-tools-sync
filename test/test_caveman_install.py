@@ -79,6 +79,19 @@ class InstallTests(unittest.TestCase):
         for name, content in before.items():
             self.assertEqual((self.installer.ROOT / name).read_bytes(), content)
 
+    def test_wrapper_refresh_reuses_verified_binary_without_build_or_fetch(self):
+        with patch.object(self.installer, "run", side_effect=self.fake_build):
+            self.installer.install(self.source)
+        wrapper = self.installer.ROOT / "caveman-proxy"
+        binary = self.installer.ROOT / "caveman-proxy.bin"
+        receipt = self.installer.ROOT / "build.json"
+        before = (binary.read_bytes(), receipt.read_bytes())
+        wrapper.write_text("#!/bin/sh\nexit 99\n")
+        with patch.object(self.installer, "run", side_effect=AssertionError("unnecessary fetch/build")):
+            self.installer.install()
+        self.assertEqual(wrapper.read_text(), self.installer.WRAPPER)
+        self.assertEqual((binary.read_bytes(), receipt.read_bytes()), before)
+
     def test_native_autostart_persists_server_output_privately(self):
         with patch.object(self.installer, "run", side_effect=self.fake_build):
             self.installer.install(self.source)
@@ -105,6 +118,25 @@ class InstallTests(unittest.TestCase):
                 self.installer.install(self.source)
         self.assertEqual(self.builds, 0)
         self.assertFalse((self.installer.ROOT / "caveman-proxy").exists())
+
+    def test_explicit_stop_blocks_native_hooks_and_server_until_resumed(self):
+        with patch.object(self.installer, "run", side_effect=self.fake_build):
+            self.installer.install(self.source)
+        wrapper = self.installer.ROOT / "caveman-proxy"
+        home = self.root / "caveman home"
+        home.mkdir()
+        marker = home / "ats-stopped"
+        marker.touch()
+        env = {**os.environ, "CAVEMAN_HOME": str(home)}
+        hook = subprocess.run([str(wrapper), "native-hook", "codex"], capture_output=True, text=True, env=env)
+        self.assertEqual(hook.returncode, 0)
+        self.assertEqual(hook.stdout, "")
+        server = subprocess.run([str(wrapper), "serve"], capture_output=True, text=True, env=env)
+        self.assertNotEqual(server.returncode, 0)
+        marker.unlink()
+        resumed = subprocess.run([str(wrapper), "native-hook", "codex"], capture_output=True, text=True, env=env)
+        self.assertEqual(resumed.returncode, 0)
+        self.assertIn("native-hook", resumed.stdout)
 
 
 if __name__ == "__main__":

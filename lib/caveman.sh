@@ -169,39 +169,82 @@ caveman_ensure_agent() {
 # on the next `claude`/`codex` session); ats start needs it back now.
 caveman_start_proxy() {
   caveman_select_proxy
-  if pgrep -f caveman-proxy >/dev/null 2>&1; then
-    ok "proxy already running on :8787"
-    return
+  local pids status
+  pids="$(listener_pids 8787)"; status=$?
+  [ "$status" -ne 2 ] || { warn "cannot inspect port 8787"; return 1; }
+  if [ -n "$pids" ]; then
+    if caveman_listener_owned; then
+      ok "proxy already listening on :8787"
+      return 0
+    fi
+    warn "port 8787 belongs to another process; preserved"
+    return 1
   fi
   if [ ! -x "$CAVEMAN_PROXY_BIN" ]; then
-    skip "caveman-proxy binary not found at $CAVEMAN_PROXY_BIN — it will self-start on the next claude/codex session"
-    return
+    warn "caveman-proxy binary not found at $CAVEMAN_PROXY_BIN"
+    return 1
   fi
   mkdir -p "$(dirname "$CAVEMAN_PROXY_LOG")" || return 1
   (umask 077; touch "$CAVEMAN_PROXY_LOG") || return 1
   chmod 600 "$CAVEMAN_PROXY_LOG" || return 1
   nohup "$CAVEMAN_PROXY_BIN" >>"$CAVEMAN_PROXY_LOG" 2>&1 &
-  sleep 1
-  if pgrep -f caveman-proxy >/dev/null 2>&1; then
-    ok "proxy started on :8787"
-  else
-    warn "proxy failed to start — try $CAVEMAN_PROXY_BIN directly"
-  fi
+  local attempt
+  for attempt in {1..10}; do
+    if caveman_listener_owned; then
+      ok "proxy listening on :8787"
+      return 0
+    fi
+    sleep 1
+  done
+  warn "proxy failed to listen on :8787; see $CAVEMAN_PROXY_LOG"
+  return 1
 }
 
-# caveman_stop_proxy — kills the caveman-proxy process if one is running.
-# No CLI subcommand owns this (caveman itself has no `stop`/`disable` verb
-# for the proxy), so this matches setup_caveman's own pgrep pattern above.
+caveman_pid_owned() {
+  local command
+  command="$(ps -p "$1" -o comm= 2>/dev/null)" || return 1
+  case "${command##*/}" in caveman-proxy|caveman-proxy.bin) return 0 ;; *) return 1 ;; esac
+}
+
+caveman_listener_owned() {
+  local pids pid
+  pids="$(listener_pids 8787)" || return 1
+  [ -n "$pids" ] || return 1
+  for pid in $pids; do
+    caveman_pid_owned "$pid" || return 1
+  done
+}
+
+# Stop only identified listeners; hook processes and other ports are separate.
 caveman_stop_proxy() {
-  if pgrep -f caveman-proxy >/dev/null 2>&1; then
-    if run pkill -f caveman-proxy; then
-      ok "proxy stopped"
-    else
-      warn "proxy stop failed"
-    fi
-  else
+  local pids pid attempt alive status
+  pids="$(listener_pids 8787)"; status=$?
+  [ "$status" -ne 2 ] || { warn "cannot inspect port 8787; no process signaled"; return 1; }
+  if [ -z "$pids" ]; then
     skip "proxy not running"
+    return 0
   fi
+  for pid in $pids; do
+    caveman_pid_owned "$pid" || { warn "port 8787 belongs to another process; preserved"; return 1; }
+  done
+  for pid in $pids; do
+    caveman_pid_owned "$pid" && run kill -TERM "$pid"
+  done
+  for attempt in {1..6}; do
+    alive=0
+    for pid in $pids; do caveman_pid_owned "$pid" && alive=1; done
+    [ "$alive" = 0 ] && { ok "proxy stopped"; return 0; }
+    sleep 1
+  done
+  for pid in $pids; do caveman_pid_owned "$pid" && run kill -KILL "$pid"; done
+  for attempt in {1..3}; do
+    alive=0
+    for pid in $pids; do caveman_pid_owned "$pid" && alive=1; done
+    [ "$alive" = 0 ] && { ok "proxy stopped"; return 0; }
+    sleep 1
+  done
+  warn "proxy stop failed: original listener still running"
+  return 1
 }
 
 # caveman_ensure_ssrf_allowlist RC_PATH — a loopback upstream (headroom on
@@ -245,10 +288,8 @@ compat:
     wire_dialect: anthropic
 YAML
   ok "caveman.yaml now chains to headroom (:8788) for compression"
-  if pgrep -f caveman-proxy >/dev/null 2>&1; then
-    run pkill -f caveman-proxy
-    sleep 1
-    caveman_start_proxy
+  if port_listening 8787; then
+    caveman_stop_proxy && caveman_start_proxy || return 1
   fi
 }
 
@@ -331,14 +372,8 @@ setup_caveman() {
   if { { [ -n "$previous_version" ] && [ -n "$current_version" ] &&
          [ "$previous_version" != "$current_version" ]; } ||
        { [ -n "$current_proxy" ] && [ "$previous_proxy" != "$current_proxy" ]; }; } &&
-     pgrep -f caveman-proxy >/dev/null 2>&1; then
-    caveman_stop_proxy
-    sleep 1
-    if pgrep -f caveman-proxy >/dev/null 2>&1; then
-      warn "updated proxy could not restart; old process still running"
-    else
-      caveman_start_proxy
-    fi
+     port_listening 8787; then
+    caveman_stop_proxy && caveman_start_proxy || return 1
   fi
 
   local status_text
@@ -354,9 +389,9 @@ setup_caveman() {
   have claude && caveman_patch_claude_route
   have codex && caveman_patch_codex_route
 
-  if pgrep -f caveman-proxy >/dev/null 2>&1; then
+  if caveman_listener_owned; then
     ok "proxy already running on :8787"
   else
-    skip "proxy not running — it starts itself on the next Claude Code / Codex session"
+    skip "proxy startup checked at end of ATS sync"
   fi
 }

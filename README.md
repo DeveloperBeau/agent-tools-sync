@@ -49,11 +49,13 @@ You can copy the directory to another machine and symlink the entry point. The s
 
 ```sh
 ats            # install/update tools and enabled integrations
-ats kill       # stop both background proxies (caveman :8787, headroom :8788)
-ats start      # bring both proxies back up, without the full sync
+ats kill       # stop both proxies and the memory worker
+ats start      # start both proxies and the memory worker, without full sync
+ats watchdog capture  # save incident evidence without restarting
+ats watchdog fire     # force Headroom recovery, ignoring detection/cooldown
 ```
 
-`ats` checks the Git checkout's upstream first. A clean checkout fast-forwards and restarts the updated script before integrations start. Offline, dirty, or diverged checkouts continue with their local version. `ats start` skips updates and waits for Headroom readiness before starting Caveman.
+`ats` checks the Git checkout's upstream first. A clean checkout fast-forwards and restarts the updated script before integrations start. Offline, dirty, or diverged checkouts continue with their local version. Full sync starts the proxy chain after setup. `ats start` skips updates and waits for Headroom readiness before starting Caveman, then starts the installed memory-worker runtime. An existing memory worker stays running, preserving its provider backoff.
 
 For proxy-only startup that leaves the memory worker and the installed Headroom fork alone, use `bash proxy-chain.sh`. It preserves healthy processes and starts the existing Headroom deployment only if its port is not listening. See [chain verification](PROXY_CHAIN.md) for agent environment exports and separate compression measurements.
 
@@ -63,7 +65,11 @@ The ATS-managed Caveman hook bridge removes unsupported context output from Code
 
 Optional standalone watchdog records separate Claude and ChatGPT Codex route health, captures incident evidence, and performs bounded Headroom recovery. It respects deliberate proxy stops and can capture reports manually. See [proxy recovery instructions](PROXY_RECOVERY.md) for installation, upstream fork maintenance, and rollback. ATS does not install or activate the watchdog automatically.
 
-`ats kill` stops Headroom until you run `ats start` or `ats`. Caveman can self-start on the next agent session, but requests through the chain fail while Headroom is stopped.
+`ats kill` records stop intent in `~/.caveman/ats-stopped` before stopping services. The ATS-managed Caveman wrapper silently skips native hooks while stopped, and the watchdog honors the marker even before Headroom is unloaded. `ats start`, full `ats` sync, and `proxy-chain.sh start` clear the marker. Shutdown waits for in-progress watchdog work under the same control lock, then waits for identified Caveman listeners, escalates only those PIDs when needed, and preserves unknown processes. Lock acquisition waits up to three minutes. Failed shutdown or unavailable process inspection returns a failing command status.
+
+`ats watchdog fire` captures evidence before restarting Headroom, bypasses the automatic detection threshold and restart cooldown, and fails if restart or readiness fails. It preserves deliberate stop intent; run `ats start` first when stopped. Restart interrupts active proxy requests. Manual recovery shares a state lock with daemon polling. If an older watchdog is still running, reload its LaunchAgent using the installation command in [proxy recovery instructions](PROXY_RECOVERY.md) before using `fire`.
+
+If hooks report `Too many open files (os error 24)`, inspect the agent process rather than restarting proxies. Codex's shared daemon can exhaust its inherited descriptor limit, affecting skill scans and command spawning as well as hooks. See [descriptor troubleshooting](PROXY_RECOVERY.md#codex-hook-descriptor-exhaustion).
 
 ## SkillOpt
 

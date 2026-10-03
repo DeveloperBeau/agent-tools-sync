@@ -141,8 +141,35 @@ If the client fails while observed Headroom routes look healthy, capture a repor
 manually. This also captures failures earlier in the chain without restarting:
 
 ```sh
-python3 /absolute/path/to/agent-tools-sync/lib/proxy_watchdog.py capture
+ats watchdog capture
 ```
+
+To request recovery immediately, regardless of observed health or cooldown:
+
+```sh
+ats watchdog fire
+```
+
+This captures evidence before restarting Headroom. It honors `ats kill` stop
+intent and an unloaded Headroom deployment; use `ats start` to resume services.
+Exit status is nonzero if state is busy, the service is deliberately stopped,
+restart fails, or readiness fails. Provider recovery still needs real traffic.
+This command interrupts active proxy requests and manages Headroom only; it
+does not restart the memory worker or Caveman.
+
+After updating watchdog source, reload an already-running older watchdog once:
+
+```sh
+python3 /absolute/path/to/agent-tools-sync/lib/proxy_watchdog.py install
+```
+
+This reloads the watchdog LaunchAgent, without requesting proxy recovery.
+Manual fire, automatic polling, and ATS shutdown share a separate control lock,
+retaining the daemon's lifetime singleton lock. Shutdown sets stop intent before
+waiting, so a recovery already underway finishes before shutdown stops services.
+Recovery also rechecks stop intent after evidence capture. Manual fire refuses
+an older running watcher that lacks this coordination.
+
 
 ```sh
 curl -sS http://127.0.0.1:8788/health/routes
@@ -243,3 +270,34 @@ headroom install restart --profile default
 
 This restores the previously installed Headroom release. Keep incident reports.
 ATS pins the diagnostic fork. A later full sync installs that build again.
+
+## Codex hook descriptor exhaustion
+
+`Too many open files (os error 24)` can occur before a hook process starts. Check
+the Codex shared daemon's open descriptors and the launchd default limit:
+
+```sh
+pid=$(python3 -c 'import json,pathlib; print(json.loads((pathlib.Path.home()/".codex/app-server-daemon/app-server.pid").read_text())["pid"])')
+lsof -nP -p "$pid" | awk 'NR>1 {types[$5]++; if ($4 ~ /^[0-9]/) total++} END {print "numeric descriptors:", total; for (t in types) print t, types[t]}'
+launchctl limit maxfiles
+```
+
+Skill scan errors and command spawn errors in
+`~/.codex/app-server-daemon/app-server.stderr.log` help distinguish host resource
+exhaustion from an individual hook failure. The limit from `launchctl` is an
+inherited default, not a direct measurement of the running daemon's limit.
+The type totals above include mapped files; numeric descriptors are the relevant
+open-descriptor count.
+
+After saving active work, restart Codex's shared daemon from a shell with a
+higher soft limit:
+
+```sh
+zsh -c 'ulimit -n 4096 && exec codex app-server daemon restart'
+```
+
+This interrupts active Codex sessions. It does not restart ATS proxies or the
+memory worker. Increasing the limit and resetting descriptors is a mitigation;
+continued descriptor growth needs host investigation. Shell limits apply to
+new children, not an already-running daemon, and this command does not change
+the machine's default for future unrelated launches.

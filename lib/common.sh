@@ -27,11 +27,43 @@ with_timeout() {
   fi
 }
 
-# port_listening PORT — 0 if something is bound and listening on PORT.
-# Isolated behind lsof so tests can stub the `lsof` binary on PATH.
-port_listening() {
-  lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+# listener_pids PORT — 0 with numeric PIDs, 1 if empty, 2 if inspection failed.
+listener_pids() {
+  local pids pid status
+  have lsof || return 2
+  pids="$(lsof -nP -tiTCP:"$1" -sTCP:LISTEN 2>&1)"; status=$?
+  [ "$status" -le 1 ] || return 2
+  [ -n "$pids" ] || { [ "$status" = 1 ] && return 1; return 2; }
+  for pid in $pids; do
+    case "$pid" in ''|*[!0-9]*) return 2 ;; esac
+  done
+  [ "$status" = 0 ] || return 2
+  printf '%s\n' "$pids"
 }
+
+port_listening() { listener_pids "$1" >/dev/null; }
+
+proxy_stop_marker() { printf '%s/ats-stopped\n' "${CAVEMAN_HOME:-$HOME/.caveman}"; }
+proxy_suspend() {
+  local marker
+  marker="$(proxy_stop_marker)"
+  (umask 077; mkdir -p "$(dirname "$marker")" && touch "$marker")
+}
+proxy_resume() { rm -f "$(proxy_stop_marker)"; }
+
+# flock belongs to the inherited open-file description. The shell retains it
+# after Python exits, then closes it when this subshell returns.
+proxy_control_run() (
+  umask 077
+  mkdir -p "$HOME/.headroom" || return 1
+  exec 9>>"$HOME/.headroom/watchdog-state.control.lock" || return 1
+  python3 -c 'import fcntl, signal; signal.alarm(180); fcntl.flock(9, fcntl.LOCK_EX)' || {
+    warn "could not acquire watchdog control lock"
+    return 1
+  }
+  # Keep the shell's saved descriptor open without passing it to service CLIs.
+  "$@" 9>&-
+)
 
 # already_added_error TEXT — 0 if TEXT looks like a "marketplace already
 # exists" error rather than a real failure. Shared by every plugin-based
