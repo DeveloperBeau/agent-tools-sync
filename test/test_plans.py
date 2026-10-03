@@ -143,6 +143,65 @@ class PlansTests(unittest.TestCase):
         self.assertTrue((folder / "_ATS Plans.md").exists())
         self.assertTrue((self.vault / "Plans.base").exists())
 
+    def test_hooks_index_non_utf8_evidence_without_changing_it(self):
+        self.run_cli("install")
+        folder = self.vault / "Example"
+        note = folder / "evidence" / "TextMeshPro.md"
+        note.parent.mkdir(parents=True)
+        original = b"# Imported documentation\n".ljust(1442, b" ") + b"\x93quoted\x94\n"
+        note.write_bytes(original)
+        for event in ("SessionStart", "UserPromptSubmit"):
+            with self.subTest(event=event):
+                result = self.run_cli(
+                    "hook", {"hook_event_name": event, "cwd": str(self.project)}
+                )
+                self.assertIn(
+                    str(folder), result["hookSpecificOutput"]["additionalContext"]
+                )
+        result = self.run_cli("hook", self.stop())
+        self.assertIn("Plan saved", result["systemMessage"])
+        self.assertIn("evidence/TextMeshPro", (folder / "_Plans.md").read_text())
+        self.assertEqual(note.read_bytes(), original)
+
+    def test_non_utf8_user_index_is_preserved(self):
+        folder = self.vault / "Example"
+        folder.mkdir(parents=True)
+        index = folder / "_Plans.md"
+        original = b"# My index\n\x93Keep this\x94\n"
+        index.write_bytes(original)
+        self.run_cli("install")
+        result = self.run_cli(
+            "hook", {"hook_event_name": "UserPromptSubmit", "cwd": str(self.project)}
+        )
+        self.assertIn(
+            "_ATS Plans.md", result["hookSpecificOutput"]["additionalContext"]
+        )
+        self.assertEqual(index.read_bytes(), original)
+
+    def test_unity_cache_is_skipped_but_normal_library_notes_are_indexed(self):
+        self.run_cli("install")
+        folder = self.vault / "Example"
+        unity = folder / "evidence" / "UnityProject"
+        settings = unity / "ProjectSettings"
+        settings.mkdir(parents=True)
+        (settings / "ProjectVersion.txt").write_text("m_EditorVersion: 6000.3.0f1\n")
+        cache = unity / "Library" / "PackageCache"
+        cache.mkdir(parents=True)
+        artifact = cache / "TextMeshPro.md"
+        original = b"# Cached documentation\n\x93quote\x94\n"
+        artifact.write_bytes(original)
+        library = folder / "Library"
+        library.mkdir()
+        (library / "user-spec.md").write_text("# User knowledge\n")
+        result = self.run_cli(
+            "hook", {"hook_event_name": "UserPromptSubmit", "cwd": str(self.project)}
+        )
+        self.assertIn("hookSpecificOutput", result)
+        index = (folder / "_Plans.md").read_text()
+        self.assertIn("Library/user-spec", index)
+        self.assertNotIn("PackageCache", index)
+        self.assertEqual(artifact.read_bytes(), original)
+
     def test_project_names_cannot_traverse_vault_or_collide(self):
         self.run_cli("install")
         self.run_cli("hook", self.stop())

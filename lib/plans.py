@@ -50,9 +50,11 @@ def atomic_write(path, text, backup=False):
 def owned(path):
     if path.is_symlink():
         return False
-    with path.open() as stream:
+    with path.open("rb") as stream:
         header = stream.read(1024)
-    return MARKER in header or header.startswith(BASE_MARKER + "\n")
+    return MARKER.encode("ascii") in header or header.startswith(
+        (BASE_MARKER + "\n").encode("ascii")
+    )
 
 
 def owned_name(folder, name, alternate):
@@ -168,6 +170,10 @@ def markdown_files(folder):
             name
             for name in children
             if not name.startswith(".") and not (Path(directory) / name).is_symlink()
+            and not (
+                name == "Library"
+                and (Path(directory) / "ProjectSettings/ProjectVersion.txt").is_file()
+            )
         )
         for name in sorted(names):
             path = Path(directory) / name
