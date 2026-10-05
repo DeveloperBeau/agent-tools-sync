@@ -9,6 +9,7 @@ Rerun ATS to check installed tools, apply updates, and refresh agent integration
 - **caveman:** proxy on `:8787`, plus agent hooks, skills, and MCP recovery. It forwards requests through headroom.
 - **headroom:** downstream compression proxy on `:8788`, plus an on-demand MCP server in Claude Code.
 - **rtk:** shell-output compression hook in both agents.
+- **xcsift:** when Xcode is installed, a Claude Code hook pipes `xcodebuild` and `swift build`/`swift test` through [xcsift](https://github.com/ldomaradzki/xcsift), after [Daniel Saidi's setup](https://danielsaidi.com/blog/2026/09/30/optimizing-claude-code-s-xcode-build-token-usage). ATS adds those commands to rtk's `exclude_commands` so the two hooks don't race to rewrite them.
 - **ponytail:** lazy-coding plugin in both agents.
 - **Ship:** optional private plugin in both agents. ATS runs `ship-update` when installed or attempts installation through authenticated GitHub CLI. If access is unavailable, sync continues with the other tools.
 - **SkillOpt:** [Microsoft's skill optimizer](https://github.com/microsoft/SkillOpt), with the SkillOpt-Sleep plugin for Claude Code and skill for Codex CLI/Desktop. It runs on demand and stages learned changes for review.
