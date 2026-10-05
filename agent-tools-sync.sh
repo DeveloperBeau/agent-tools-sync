@@ -36,6 +36,8 @@ fi
 source "$SCRIPT_DIR/lib/headroom.sh"
 # shellcheck source=lib/rtk.sh
 source "$SCRIPT_DIR/lib/rtk.sh"
+# shellcheck source=lib/xcsift.sh
+source "$SCRIPT_DIR/lib/xcsift.sh"
 # shellcheck source=lib/caveman.sh
 source "$SCRIPT_DIR/lib/caveman.sh"
 # shellcheck source=lib/ponytail.sh
@@ -114,6 +116,7 @@ main() {
   proxy_resume || return 1
   setup_headroom
   setup_rtk
+  setup_xcsift
   setup_caveman
   setup_ponytail
   setup_evolver
@@ -128,6 +131,7 @@ main() {
   echo "  caveman    → both agents' base URL, proxy on :8787, chains to headroom"
   echo "  headroom   → downstream compression hop on :$HEADROOM_PORT, on-demand MCP in Claude Code"
   echo "  rtk        → shell-output hook in both Claude Code and Codex"
+  echo "  xcsift     → compact xcodebuild/swift build output in Claude Code"
   echo "  ponytail   → plugin in both Claude Code and Codex"
   echo "  evolver    → session hooks in both Claude Code and Codex"
   echo "  claude-mem → cross-session memory plugin in both, worker daemon on its own port"
