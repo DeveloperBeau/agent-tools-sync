@@ -4,7 +4,7 @@
 
 c_reset=$'\033[0m'; c_bold=$'\033[1m'; c_green=$'\033[32m'; c_yellow=$'\033[33m'
 c_red=$'\033[31m'; c_blue=$'\033[34m'
-ATS_VERSION=1.8.0
+ATS_VERSION=1.8.1
 
 section() { printf '\n%s== %s ==%s\n' "$c_bold$c_blue" "$1" "$c_reset"; }
 ok()      { printf '  %s✔%s %s\n' "$c_green" "$c_reset" "$1"; }
@@ -18,11 +18,13 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # either is on PATH. Falls back to running unbounded on a machine without
 # coreutils (this repo is meant to be portable). Use for any network call
 # (update checks, install status probes) that could otherwise hang a whole
-# run with only Ctrl-C to escape.
+# run with only Ctrl-C to escape. --foreground keeps CMD in the terminal's
+# process group; without it a TTY-touching CLI (claude) is stopped by
+# SIGTTOU/SIGTTIN and hangs until the timeout kills it.
 with_timeout() {
   local secs="$1"; shift
-  if have timeout; then timeout "$secs" "$@"
-  elif have gtimeout; then gtimeout "$secs" "$@"
+  if have timeout; then timeout --foreground "$secs" "$@"
+  elif have gtimeout; then gtimeout --foreground "$secs" "$@"
   else "$@"
   fi
 }
