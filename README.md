@@ -130,7 +130,7 @@ embedder:
     dimensions: 4096
 ```
 
-Run `grepai watch` to index. Change the model or dimensions only before indexing, or delete `.grepai/` and reindex; embeddings from different models are not comparable. ATS adds no agent instructions for these tools.
+Run `grepai watch` to index. Watching a repo indexes every git worktree of it, each roughly as costly as the main checkout, so prune merged worktrees first. grepai also appends `.grepai/` to each checkout's tracked `.gitignore` when it first sets it up, and `grepai init` does the same in the main checkout. The global excludes already cover this, so the line is redundant and leaves a modified tracked file that is easy to commit by accident. After the first index, run `git checkout -- .gitignore` in each checkout whose only change to that file is that line. Change the model or dimensions only before indexing, or delete `.grepai/` and reindex; embeddings from different models are not comparable. ATS adds no agent instructions for these tools.
 
 ## Context7 and Serena
 
