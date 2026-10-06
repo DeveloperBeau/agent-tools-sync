@@ -125,8 +125,16 @@ common_probe_error() (
 check 'listener inspection distinguishes errors from empty port' common_probe_error
 
 full_sync_start() (
-  local order="" result="$1"
-  SCRIPT_DIR=/fixture
+  local order="" result="$1" expected="$2"
+  shift 2
+  CAVEMAN_HOME="$(mktemp -d)"
+  trap 'rm -rf "$CAVEMAN_HOME"' EXIT
+  SCRIPT_DIR=/fixture HEADROOM_PORT=8788
+  caveman_route_agents() { order="${order}[$1]"; }
+  proxy_control_run() { "$@"; }
+  headroom_stop_proxy() { order="${order}h"; }
+  caveman_stop_proxy() { order="${order}c"; }
+  python3() { order="${order}W"; }
   proxy_resume() { order="${order}R"; }
   setup_headroom() { order="${order}H"; }
   setup_rtk() { :; }
@@ -141,12 +149,16 @@ full_sync_start() (
   setup_obsidian() { order="${order}O"; }
   obsidian_enabled() { return 1; }
   bash() { [ "$*" = '/fixture/proxy-chain.sh start' ] || return 99; order="${order}S"; return "$result"; }
-  main >/dev/null
+  main "$@" >/dev/null
   status=$?
-  [ "$status" = "$result" ] && [ "$order" = RHC7NOS ]
+  [ "$status" = "$result" ] && [ "$order" = "$expected" ] || { echo "$order"; return 1; }
 )
-check 'full sync starts existing chain after setup' full_sync_start 0
-check 'full sync propagates chain startup failure' full_sync_start 1
+check 'full sync starts existing chain after setup' full_sync_start 0 "RHC7NO[full]S"
+check 'full sync propagates chain startup failure' full_sync_start 1 "RHC7NO[full]S"
+check 'no-headroom skips Headroom setup and stops it' full_sync_start 0 "RC7NO[no-headroom]hS" --no-headroom
+check 'no-caveman skips Caveman setup, refreshes its wrapper, stops it' full_sync_start 0 "RHW7NO[no-caveman]cS" --no-caveman
+check 'both flags give direct mode with both proxies stopped' full_sync_start 0 "RW7NO[direct]hcS" --no-headroom --no-caveman
+check_fail 'unknown flag is rejected' full_sync_start 0 "" --bogus
 
 control_lock_check() (
   HOME="$(mktemp -d)"

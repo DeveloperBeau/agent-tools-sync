@@ -104,6 +104,19 @@ cmd_start() {
   claude_mem_start_worker
 }
 
+# stop_unused_proxies — stops each proxy that the current mode does not use.
+stop_unused_proxies() {
+  local failed=0
+  ats_uses headroom || headroom_stop_proxy || failed=1
+  ats_uses caveman || caveman_stop_proxy || failed=1
+  [ "$failed" -eq 0 ]
+}
+
+usage() {
+  echo "usage: agent-tools-sync [--no-headroom] [--no-caveman] | kill | start | watchdog capture|fire" >&2
+  return 1
+}
+
 main() {
   case "${1:-}" in
     kill) cmd_kill; return ;;
@@ -113,17 +126,35 @@ main() {
         capture|fire) [ "$#" -eq 2 ] || return 1; python3 "$SCRIPT_DIR/lib/proxy_watchdog.py" "$2"; return ;;
         *) echo "usage: ats watchdog [capture|fire]" >&2; return 1 ;;
       esac ;;
-    "") ;;
-    *) echo "usage: agent-tools-sync [kill|start|watchdog capture|watchdog fire]" >&2; return 1 ;;
+  esac
+
+  local no_headroom=false no_caveman=false mode=full arg
+  for arg in "$@"; do
+    case "$arg" in
+      --no-headroom) no_headroom=true ;;
+      --no-caveman) no_caveman=true ;;
+      *) usage; return ;;
+    esac
+  done
+  case "$no_headroom:$no_caveman" in
+    true:true) mode=direct ;;
+    true:false) mode=no-headroom ;;
+    false:true) mode=no-caveman ;;
   esac
 
   proxy_resume || return 1
-  setup_headroom
+  ats_set_mode "$mode" || return 1
+  ats_uses headroom && setup_headroom
   setup_rtk
   setup_xcsift
   setup_search_tools
   setup_grepai
-  setup_caveman
+  if ats_uses caveman; then
+    setup_caveman
+  elif ! python3 "$CAVEMAN_PROXY_INSTALLER" >/dev/null; then
+    # The wrapper update makes Caveman's native hooks honor the mode.
+    warn "Caveman wrapper refresh failed; its hooks may restart the proxy"
+  fi
   setup_ponytail
   setup_evolver
   setup_claude_mem
@@ -132,10 +163,20 @@ main() {
   setup_context7
   setup_serena
   setup_obsidian
+  section "proxy mode: $mode"
+  caveman_route_agents "$mode" || warn "agent routing incomplete; check the messages above"
+  proxy_control_run stop_unused_proxies || return 1
   bash "$SCRIPT_DIR/proxy-chain.sh" start || return 1
   section "done"
-  echo "  caveman    → both agents' base URL, proxy on :8787, chains to headroom"
-  echo "  headroom   → downstream compression hop on :$HEADROOM_PORT, on-demand MCP in Claude Code"
+  case "$mode" in
+    full)
+      echo "  caveman    → both agents' base URL, proxy on :8787, chains to headroom"
+      echo "  headroom   → downstream compression hop on :$HEADROOM_PORT, on-demand MCP in Claude Code" ;;
+    no-headroom) echo "  caveman    → both agents' base URL on :8787, native routes; headroom stopped" ;;
+    no-caveman) echo "  headroom   → both agents' base URL on :$HEADROOM_PORT; caveman proxy stopped" ;;
+    direct) echo "  proxies    → none; both agents call their provider directly" ;;
+  esac
+  [ "$mode" = full ] || echo "  Run plain 'ats' to restore the full caveman → headroom chain."
   echo "  rtk        → shell-output hook in both Claude Code and Codex"
   echo "  xcsift     → compact xcodebuild/swift build output in Claude Code"
   echo "  search     → ripgrep, fd, sd and ast-grep for fast code search and rewriting"
@@ -150,7 +191,7 @@ main() {
   if obsidian_enabled; then
     echo "  plans      → shared Obsidian vault, automatic Claude and Codex plan capture"
   fi
-  echo "  Run 'claude' or 'codex' as usual."
+  echo "  Run 'claude' or 'codex' as usual. Restart open sessions after a mode change."
 }
 
 main "$@"

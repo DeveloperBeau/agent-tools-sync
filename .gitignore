@@ -1,3 +1,4 @@
 # Created by older Evolver project-scoped setup runs.
 /.codex/
 /.evolver/
+__pycache__/

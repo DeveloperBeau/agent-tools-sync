@@ -30,6 +30,13 @@ if [ -e "${CAVEMAN_HOME:-$HOME/.caveman}/ats-stopped" ]; then
     serve) echo "ATS proxies deliberately stopped; run ats start." >&2; exit 1 ;;
   esac
 fi
+case "$(cat "${CAVEMAN_HOME:-$HOME/.caveman}/ats-mode" 2>/dev/null)" in
+  no-caveman|direct)
+    case "${1:-serve}" in
+      native-hook) exit 0 ;;
+      serve) echo "ATS mode skips Caveman; run plain ats to restore it." >&2; exit 1 ;;
+    esac ;;
+esac
 if [ "$#" -eq 0 ] || [ "$1" = serve ]; then
   caveman_log="${CAVEMAN_HOME:-$HOME/.caveman}/proxy.log"
   mkdir -p "$(dirname -- "$caveman_log")" || exit 1
