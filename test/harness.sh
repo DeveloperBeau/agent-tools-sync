@@ -6,6 +6,11 @@
 TESTS_RUN=0
 TESTS_FAILED=0
 
+# Tests must not read or write the real ATS stop marker or proxy mode.
+HARNESS_CAVEMAN_HOME="$(mktemp -d)"
+CAVEMAN_HOME="$HARNESS_CAVEMAN_HOME"
+export CAVEMAN_HOME
+
 # check DESC CMD [ARGS...] — expects CMD to exit 0 (a "success case" test).
 check() {
   local desc="$1"; shift
@@ -56,5 +61,6 @@ assert_contains() {
 
 report() {
   printf '\n%d run, %d failed\n' "$TESTS_RUN" "$TESTS_FAILED"
+  rm -rf "$HARNESS_CAVEMAN_HOME"
   [ "$TESTS_FAILED" -eq 0 ]
 }

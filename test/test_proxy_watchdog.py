@@ -86,6 +86,51 @@ class RecoveryDecisionTests(unittest.TestCase):
                 with watchdog._state_lock(blocking=False):
                     pass
 
+    def test_failed_restart_reloads_unloaded_launch_agent_and_keeps_error(self):
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append(command[:2])
+            if command[0].endswith("headroom"):
+                return subprocess.CompletedProcess(command, 1, "", "Traceback\nError: launchctl could not start: 5: Input/output error\n")
+            if command[1] == "print":
+                return subprocess.CompletedProcess(command, 113, b"", b"")
+            # The first bootstrap hits launchd's EIO window, the second loads the job.
+            ok = sum(call[1] == "bootstrap" for call in calls) > 1
+            return subprocess.CompletedProcess(command, 0 if ok else 5, "", "" if ok else "Bootstrap failed: 5\n")
+
+        with tempfile.TemporaryDirectory() as home:
+            plist = pathlib.Path(home) / "Library/LaunchAgents/com.headroom.default.plist"
+            plist.parent.mkdir(parents=True)
+            plist.touch()
+            with patch.object(watchdog.Path, "home", return_value=pathlib.Path(home)), \
+                 patch.object(watchdog.subprocess, "run", side_effect=run), \
+                 patch.object(watchdog.time, "sleep"):
+                result = watchdog._restart_headroom()
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["restart_exit_code"], 1)
+        self.assertEqual(result["error"], "Error: launchctl could not start: 5: Input/output error")
+        self.assertEqual(result["fallback"], {"action": "bootstrap", "exit_code": 0, "error": None})
+        self.assertEqual([call[1] for call in calls[1:]], ["print", "bootstrap", "bootstrap"])
+
+    def test_failed_restart_kickstarts_a_loaded_job(self):
+        def run(command, **kwargs):
+            code = 1 if command[0].endswith("headroom") else 0
+            return subprocess.CompletedProcess(command, code, "", "")
+
+        with patch.object(watchdog.subprocess, "run", side_effect=run) as runner:
+            result = watchdog._restart_headroom()
+        self.assertEqual(result["fallback"]["action"], "kickstart")
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(runner.call_args_list[-1].args[0][:2], ["launchctl", "kickstart"])
+
+    def test_successful_restart_skips_fallback(self):
+        with patch.object(watchdog.subprocess, "run",
+                          return_value=subprocess.CompletedProcess([], 0, "", "")) as runner:
+            result = watchdog._restart_headroom()
+        self.assertEqual(result, {"exit_code": 0, "output": "omitted_metadata_only"})
+        runner.assert_called_once()
+
     def test_stop_marker_blocks_loaded_service_without_launchctl_probe(self):
         with tempfile.TemporaryDirectory() as directory:
             (pathlib.Path(directory) / "ats-stopped").touch()

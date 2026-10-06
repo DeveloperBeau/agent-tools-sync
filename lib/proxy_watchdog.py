@@ -560,6 +560,45 @@ def _notify(message: str) -> None:
         pass
 
 
+def _error_tail(text: str | None) -> str | None:
+    """Keep the last line of CLI error output. It names launchd and deployment state, not traffic."""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    return lines[-1][:240] if lines else None
+
+
+def _reload_launch_agent() -> dict:
+    """Load and start the Headroom job again after a restart left it unloaded.
+
+    `headroom install restart` unloads the job before it loads it again. If the
+    load fails, launchd KeepAlive cannot help, and _managed_headroom_loaded()
+    reports a deliberate stop, so no later poll recovers it.
+    """
+    domain = f"gui/{os.getuid()}"
+    target = f"{domain}/com.headroom.default"
+    plist = Path.home() / "Library/LaunchAgents/com.headroom.default.plist"
+    try:
+        loaded = subprocess.run(["launchctl", "print", target], capture_output=True, timeout=5,
+                                check=False).returncode == 0
+        if loaded:
+            result = subprocess.run(["launchctl", "kickstart", target], capture_output=True,
+                                    text=True, timeout=15, check=False)
+            return {"action": "kickstart", "exit_code": result.returncode,
+                    "error": _error_tail(result.stderr) if result.returncode else None}
+        if not plist.exists():
+            return {"action": "bootstrap", "exit_code": None, "error": "launch_agent_plist_missing"}
+        # launchd can return EIO for some seconds while it releases the old job.
+        for _ in range(30):
+            result = subprocess.run(["launchctl", "bootstrap", domain, str(plist)], capture_output=True,
+                                    text=True, timeout=15, check=False)
+            if result.returncode == 0:
+                break
+            time.sleep(1)
+        return {"action": "bootstrap", "exit_code": result.returncode,
+                "error": _error_tail(result.stderr) if result.returncode else None}
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"action": "reload", "exit_code": None, "probe_error": type(error).__name__}
+
+
 def _restart_headroom() -> dict:
     try:
         result = subprocess.run(
@@ -569,9 +608,16 @@ def _restart_headroom() -> dict:
             timeout=90,
             check=False,
         )
-        return {"exit_code": result.returncode, "output": "omitted_metadata_only"}
+        restart = {"exit_code": result.returncode, "output": "omitted_metadata_only"}
+        if result.returncode == 0:
+            return restart
+        restart["error"] = _error_tail(result.stderr or result.stdout)
     except (OSError, subprocess.TimeoutExpired) as error:
-        return {"exit_code": None, "probe_error": type(error).__name__, "output": "omitted_metadata_only"}
+        restart = {"exit_code": None, "probe_error": type(error).__name__, "output": "omitted_metadata_only"}
+    restart["restart_exit_code"] = restart["exit_code"]
+    restart["fallback"] = _reload_launch_agent()
+    restart["exit_code"] = restart["fallback"]["exit_code"]
+    return restart
 
 
 def _ready_after_restart() -> bool:
