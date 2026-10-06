@@ -3,6 +3,25 @@ set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/harness.sh"
 source "$HERE/../proxy-chain.sh"
+CAVEMAN_HOME="$(mktemp -d)"
+export CAVEMAN_HOME
+trap 'rm -rf "$CAVEMAN_HOME"' EXIT
+
+# mode_check MODE EXPECTED — cold start in MODE starts only that mode's proxies.
+mode_check() (
+  ats_set_mode "$1"
+  order=""
+  proxy_resume() { :; }
+  caveman_yaml_has_headroom_stack() { return 1; }
+  chain_start_headroom() { order="${order}H"; }
+  chain_start_caveman() { order="${order}C"; }
+  chain_start >/dev/null 2>&1 || [ "$1" = full ] || return 1
+  [ "$order" = "$2" ]
+)
+check "no-headroom starts Caveman only, without the Headroom mount" mode_check no-headroom C
+check "no-caveman starts Headroom only" mode_check no-caveman H
+check "direct starts no proxy" mode_check direct ""
+check "full mode still requires the Headroom mount" mode_check full ""
 
 startup_check() (
   scenario="$1" expected="$2" order="" hr=0 cave=0
@@ -53,5 +72,13 @@ check "Env output is sourceable and routes both APIs through Caveman" bash -c '
   eval "$(chain_env)"
   [ "$ANTHROPIC_BASE_URL" = http://127.0.0.1:8787/compat/headroom ] &&
   [ "$OPENAI_BASE_URL" = http://127.0.0.1:8787/compat/headroom/v1 ]
+' bash "$HERE/../proxy-chain.sh"
+check "Env output follows the persisted mode" bash -c '
+  source "$1"
+  ats_set_mode no-caveman; eval "$(chain_env)"
+  [ "$ANTHROPIC_BASE_URL" = http://127.0.0.1:8788 ] && [ "$OPENAI_BASE_URL" = http://127.0.0.1:8788/v1 ] || exit 1
+  ats_set_mode direct; eval "$(chain_env)"
+  [ -z "${ANTHROPIC_BASE_URL+x}" ] && [ -z "${OPENAI_BASE_URL+x}" ] || exit 1
+  ats_set_mode full
 ' bash "$HERE/../proxy-chain.sh"
 report

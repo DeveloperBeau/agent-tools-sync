@@ -236,4 +236,35 @@ assert_eq "private proxy: shell override preserves spaces" '/tmp/private proxy/c
 rm -f "$tmp_rc"
 check "private proxy: pinned install, atomic failure fallback and wrapper delegation" python3 "$HERE/test_caveman_install.py"
 
+# --- route_agents (real temp files, one per proxy mode) ----------------------
+route_dir="$(mktemp -d)"
+printf '{\n  "env": {\n    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787/compat/headroom",\n    "KEEP": "1"\n  }\n}\n' > "$route_dir/settings.json"
+printf 'model_provider = "caveman"\n\n[model_providers.caveman]\nbase_url = "http://127.0.0.1:8787/compat/headroom"\n\n[model_providers.headroom]\nbase_url = "http://127.0.0.1:8787/compat/headroom"\n\n[model_providers.other]\nbase_url = "http://127.0.0.1:8787/compat/headroom"\n' > "$route_dir/config.toml"
+route() {
+  CAVEMAN_CLAUDE_SETTINGS="$route_dir/settings.json" CAVEMAN_CODEX_CONFIG="$route_dir/config.toml" \
+    caveman_route_agents "$1" >/dev/null
+}
+claude_url() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["env"].get("ANTHROPIC_BASE_URL","<unset>"))' "$route_dir/settings.json"; }
+route no-headroom
+assert_eq "route no-headroom: Claude uses Caveman's native route" "http://127.0.0.1:8787/w/claude" "$(claude_url)"
+assert_contains "route no-headroom: Codex uses Caveman's native route" "$(cat "$route_dir/config.toml")" \
+  $'[model_providers.caveman]\nbase_url = "http://127.0.0.1:8787/chatgpt"'
+route no-caveman
+assert_eq "route no-caveman: Claude goes straight to Headroom" "http://127.0.0.1:8788" "$(claude_url)"
+assert_contains "route no-caveman: saved headroom chats follow too" "$(cat "$route_dir/config.toml")" \
+  $'[model_providers.headroom]\nbase_url = "http://127.0.0.1:8788"'
+route direct
+assert_eq "route direct: Claude has no base URL override" "<unset>" "$(claude_url)"
+assert_contains "route direct: Codex calls the ChatGPT backend" "$(cat "$route_dir/config.toml")" \
+  $'[model_providers.caveman]\nbase_url = "https://chatgpt.com/backend-api/codex"'
+assert_contains "route direct: unrelated settings survive" "$(cat "$route_dir/settings.json")" '"KEEP": "1"'
+route full
+assert_eq "route full: Claude returns to the chain" "http://127.0.0.1:8787/compat/headroom" "$(claude_url)"
+assert_contains "route: other providers are never touched" "$(cat "$route_dir/config.toml")" \
+  $'[model_providers.other]\nbase_url = "http://127.0.0.1:8787/compat/headroom"'
+printf '{"env":{"ANTHROPIC_BASE_URL":"https://custom.example"}}\n' > "$route_dir/settings.json"
+check_fail "route: a custom Claude base URL is preserved and reported" route direct
+assert_eq "route: custom Claude base URL unchanged" "https://custom.example" "$(claude_url)"
+rm -rf "$route_dir"
+
 report

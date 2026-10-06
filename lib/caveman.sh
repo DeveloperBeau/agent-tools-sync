@@ -360,6 +360,70 @@ caveman_patch_codex_route() {
   fi
 }
 
+# caveman_route_url MODE claude|codex — the base URL that the agent uses in
+# MODE. An empty result for Claude means no override, so it calls Anthropic.
+# Headroom serves both APIs at its root. Caveman's /chatgpt route forwards to
+# the ChatGPT Codex backend, so direct Codex uses that backend itself.
+caveman_route_url() {
+  case "$1:$2" in
+    full:*) echo "http://127.0.0.1:8787/compat/headroom" ;;
+    no-headroom:claude) echo "http://127.0.0.1:8787/w/claude" ;;
+    no-headroom:codex) echo "http://127.0.0.1:8787/chatgpt" ;;
+    no-caveman:*) echo "http://127.0.0.1:${HEADROOM_PORT:-8788}" ;;
+    direct:claude) echo "" ;;
+    direct:codex) echo "https://chatgpt.com/backend-api/codex" ;;
+    *) return 1 ;;
+  esac
+}
+
+# caveman_route_agents MODE — points Claude Code and Codex at the first hop of
+# MODE. Only ATS-managed URLs change; a custom base URL stays. Running agents
+# keep their old route until they restart.
+caveman_route_agents() {
+  local mode="$1" claude_url codex_url
+  claude_url="$(caveman_route_url "$mode" claude)" || return 1
+  codex_url="$(caveman_route_url "$mode" codex)" || return 1
+  python3 - "$CAVEMAN_CLAUDE_SETTINGS" "$CAVEMAN_CODEX_CONFIG" "$claude_url" "$codex_url" "${HEADROOM_PORT:-8788}" <<'PY'
+import json, re, sys
+from pathlib import Path
+claude, codex, claude_url, codex_url, port = sys.argv[1:]
+managed = {"http://127.0.0.1:8787/compat/headroom", "http://127.0.0.1:8787/w/claude",
+           "http://127.0.0.1:8787/chatgpt", f"http://127.0.0.1:{port}",
+           "https://chatgpt.com/backend-api/codex"}
+status = 0
+path = Path(claude)
+if path.exists():
+    data = json.loads(path.read_text())
+    env = data.setdefault("env", {})
+    current = env.get("ANTHROPIC_BASE_URL")
+    if current is not None and current not in managed:
+        print(f"  ! Claude Code base URL {current} is custom; preserved")
+        status = 1
+    elif current != (claude_url or None):
+        if claude_url:
+            env["ANTHROPIC_BASE_URL"] = claude_url
+        else:
+            env.pop("ANTHROPIC_BASE_URL", None)
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        print(f"  ✔ Claude Code now routes to {claude_url or 'Anthropic directly'}")
+path = Path(codex)
+if path.exists():
+    text, table, lines = path.read_text(), None, []
+    for line in text.splitlines(keepends=True):
+        header = re.match(r"\s*\[([^\]]+)\]", line)
+        if header:
+            table = header.group(1).strip()
+        value = re.match(r'base_url = "([^"]*)"', line)
+        if table in ("model_providers.caveman", "model_providers.headroom") and value and value.group(1) in managed:
+            line = f'base_url = "{codex_url}"\n'
+        lines.append(line)
+    if "".join(lines) != text:
+        path.write_text("".join(lines))
+        print(f"  ✔ Codex now routes to {codex_url}")
+sys.exit(status)
+PY
+}
+
 setup_caveman() {
   section "caveman"
   local previous_version="" current_version previous_proxy current_proxy
@@ -386,8 +450,11 @@ setup_caveman() {
   export CAVE_SSRF_ALLOWLIST="${CAVE_SSRF_ALLOWLIST:-127.0.0.1:8788}"
 
   caveman_ensure_stack_config
-  have claude && caveman_patch_claude_route
-  have codex && caveman_patch_codex_route
+  # Without Headroom, caveman_route_agents keeps Caveman's native routes.
+  if ats_uses headroom; then
+    have claude && caveman_patch_claude_route
+    have codex && caveman_patch_codex_route
+  fi
 
   if caveman_listener_owned; then
     ok "proxy already running on :8787"

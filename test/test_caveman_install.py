@@ -138,6 +138,23 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(resumed.returncode, 0)
         self.assertIn("native-hook", resumed.stdout)
 
+    def test_modes_without_caveman_block_native_hooks_and_server(self):
+        with patch.object(self.installer, "run", side_effect=self.fake_build):
+            self.installer.install(self.source)
+        wrapper = self.installer.ROOT / "caveman-proxy"
+        home = self.root / "mode home"
+        home.mkdir()
+        env = {**os.environ, "CAVEMAN_HOME": str(home)}
+        for mode in ("no-caveman", "direct"):
+            (home / "ats-mode").write_text(mode + "\n")
+            hook = subprocess.run([str(wrapper), "native-hook", "codex"], capture_output=True, text=True, env=env)
+            self.assertEqual((hook.returncode, hook.stdout), (0, ""))
+            server = subprocess.run([str(wrapper), "serve"], capture_output=True, text=True, env=env)
+            self.assertNotEqual(server.returncode, 0)
+        (home / "ats-mode").write_text("no-headroom\n")
+        allowed = subprocess.run([str(wrapper), "native-hook", "codex"], capture_output=True, text=True, env=env)
+        self.assertIn("native-hook", allowed.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

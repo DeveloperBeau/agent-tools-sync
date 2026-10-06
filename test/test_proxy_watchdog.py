@@ -94,6 +94,20 @@ class RecoveryDecisionTests(unittest.TestCase):
                 self.assertFalse(watchdog._managed_headroom_loaded())
                 run.assert_not_called()
 
+    def test_modes_without_headroom_block_recovery(self):
+        for mode in ("no-headroom", "direct"):
+            with tempfile.TemporaryDirectory() as directory:
+                (pathlib.Path(directory) / "ats-mode").write_text(mode + "\n")
+                with patch.dict(watchdog.os.environ, {"CAVEMAN_HOME": directory}), \
+                     patch.object(watchdog.subprocess, "run") as run:
+                    self.assertFalse(watchdog._managed_headroom_loaded())
+                    run.assert_not_called()
+        with tempfile.TemporaryDirectory() as directory:
+            (pathlib.Path(directory) / "ats-mode").write_text("no-caveman\n")
+            with patch.dict(watchdog.os.environ, {"CAVEMAN_HOME": directory}), \
+                 patch.object(watchdog.subprocess, "run", return_value=watchdog.subprocess.CompletedProcess([], 0)):
+                self.assertTrue(watchdog._managed_headroom_loaded())
+
     def test_manual_fire_returns_failure_for_failed_restart_or_missing_readiness(self):
         for exit_code, ready in [(1, True), (0, False)]:
             with self.subTest(exit_code=exit_code, ready=ready), tempfile.TemporaryDirectory() as directory:

@@ -53,7 +53,10 @@ You can copy the directory to another machine and symlink the entry point. The s
 ## Usage
 
 ```sh
-ats            # install/update tools and enabled integrations
+ats            # install/update tools and enabled integrations, full proxy chain
+ats --no-headroom               # same sync, agents → Caveman → provider
+ats --no-caveman                # same sync, agents → Headroom → provider
+ats --no-headroom --no-caveman  # same sync, agents → provider (direct)
 ats kill       # stop both proxies and the memory worker
 ats start      # start both proxies and the memory worker, without full sync
 ats watchdog capture  # save incident evidence without restarting
@@ -69,6 +72,15 @@ During full sync, ATS checks tool updates before setup. Headroom stays pinned to
 The ATS-managed Caveman hook bridge removes unsupported context output from Codex `PostCompact` callbacks while preserving lifecycle recording, warnings, and stop controls. Codex restores Caveman context through its supported `SessionStart` callback with `source: compact`. This correction survives vendor CLI updates.
 
 Optional standalone watchdog records separate Claude and ChatGPT Codex route health, captures incident evidence, and performs bounded Headroom recovery. It respects deliberate proxy stops and can capture reports manually. See [proxy recovery instructions](PROXY_RECOVERY.md) for installation, upstream fork maintenance, and rollback. ATS does not install or activate the watchdog automatically.
+
+The proxy flags select a mode, and ATS keeps the mode in `~/.caveman/ats-mode` (or `$CAVEMAN_HOME`). A plain `ats` run removes the file and restores the full chain. The sync does not install or update a skipped proxy. It stops the skipped proxy and points Claude Code and Codex at the first hop that remains. ATS changes only base URLs that it manages, and keeps a custom URL. `ats start` and `proxy-chain.sh start` start only the proxies that the mode uses. The watchdog does not restart Headroom in the `no-headroom` or `direct` mode. The Caveman wrapper skips native hooks in the `no-caveman` or `direct` mode. Restart open agent sessions after a mode change, because a session keeps the route that it started with.
+
+| Mode | Claude Code base URL | Codex base URL |
+|---|---|---|
+| full | `http://127.0.0.1:8787/compat/headroom` | `http://127.0.0.1:8787/compat/headroom` |
+| no-headroom | `http://127.0.0.1:8787/w/claude` | `http://127.0.0.1:8787/chatgpt` |
+| no-caveman | `http://127.0.0.1:8788` | `http://127.0.0.1:8788` |
+| direct | none (Anthropic) | `https://chatgpt.com/backend-api/codex` |
 
 `ats kill` records stop intent in `~/.caveman/ats-stopped` before stopping services. The ATS-managed Caveman wrapper silently skips native hooks while stopped, and the watchdog honors the marker even before Headroom is unloaded. `ats start`, full `ats` sync, and `proxy-chain.sh start` clear the marker. Shutdown waits for in-progress watchdog work under the same control lock, then waits for identified Caveman listeners, escalates only those PIDs when needed, and preserves unknown processes. Lock acquisition waits up to three minutes. Failed shutdown or unavailable process inspection returns a failing command status.
 

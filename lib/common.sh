@@ -4,7 +4,7 @@
 
 c_reset=$'\033[0m'; c_bold=$'\033[1m'; c_green=$'\033[32m'; c_yellow=$'\033[33m'
 c_red=$'\033[31m'; c_blue=$'\033[34m'
-ATS_VERSION=1.9.0
+ATS_VERSION=1.10.0
 
 section() { printf '\n%s== %s ==%s\n' "$c_bold$c_blue" "$1" "$c_reset"; }
 ok()      { printf '  %s✔%s %s\n' "$c_green" "$c_reset" "$1"; }
@@ -66,6 +66,30 @@ proxy_suspend() {
   (umask 077; mkdir -p "$(dirname "$marker")" && touch "$marker")
 }
 proxy_resume() { rm -f "$(proxy_stop_marker)"; }
+
+# The proxy mode persists between runs. It is full (both proxies) when the
+# file is absent, else no-headroom, no-caveman or direct (no proxies).
+ats_mode_file() { printf '%s/ats-mode\n' "${CAVEMAN_HOME:-$HOME/.caveman}"; }
+ats_mode() {
+  case "$(cat "$(ats_mode_file)" 2>/dev/null)" in
+    no-headroom) echo no-headroom ;;
+    no-caveman) echo no-caveman ;;
+    direct) echo direct ;;
+    *) echo full ;;
+  esac
+}
+ats_set_mode() {
+  local file
+  file="$(ats_mode_file)"
+  if [ "$1" = full ]; then rm -f "$file"; return; fi
+  (umask 077; mkdir -p "$(dirname "$file")" && printf '%s\n' "$1" > "$file")
+}
+# ats_uses headroom|caveman — 0 if the current mode runs that proxy.
+ats_uses() {
+  case "$1:$(ats_mode)" in
+    headroom:no-headroom|headroom:direct|caveman:no-caveman|caveman:direct) return 1 ;;
+  esac
+}
 
 # flock belongs to the inherited open-file description. The shell retains it
 # after Python exits, then closes it when this subshell returns.

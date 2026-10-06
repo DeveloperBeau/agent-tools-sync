@@ -669,8 +669,15 @@ def _persist_first_faults(snapshot: dict, state: dict, now: float) -> dict | Non
 
 
 def _managed_headroom_loaded() -> bool:
-    if (Path(os.environ.get("CAVEMAN_HOME", str(Path.home() / ".caveman"))) / "ats-stopped").exists():
+    caveman_home = Path(os.environ.get("CAVEMAN_HOME", str(Path.home() / ".caveman")))
+    if (caveman_home / "ats-stopped").exists():
         return False
+    # The no-headroom and direct ATS modes stop Headroom on purpose.
+    try:
+        if (caveman_home / "ats-mode").read_text().strip() in {"no-headroom", "direct"}:
+            return False
+    except OSError:
+        pass
     try:
         result = subprocess.run(
             ["launchctl", "print", f"gui/{os.getuid()}/com.headroom.default"],
