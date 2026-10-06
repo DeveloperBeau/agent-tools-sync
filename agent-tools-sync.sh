@@ -38,6 +38,10 @@ source "$SCRIPT_DIR/lib/headroom.sh"
 source "$SCRIPT_DIR/lib/rtk.sh"
 # shellcheck source=lib/xcsift.sh
 source "$SCRIPT_DIR/lib/xcsift.sh"
+# shellcheck source=lib/search-tools.sh
+source "$SCRIPT_DIR/lib/search-tools.sh"
+# shellcheck source=lib/grepai.sh
+source "$SCRIPT_DIR/lib/grepai.sh"
 # shellcheck source=lib/caveman.sh
 source "$SCRIPT_DIR/lib/caveman.sh"
 # shellcheck source=lib/ponytail.sh
@@ -117,6 +121,8 @@ main() {
   setup_headroom
   setup_rtk
   setup_xcsift
+  setup_search_tools
+  setup_grepai
   setup_caveman
   setup_ponytail
   setup_evolver
@@ -132,6 +138,8 @@ main() {
   echo "  headroom   → downstream compression hop on :$HEADROOM_PORT, on-demand MCP in Claude Code"
   echo "  rtk        → shell-output hook in both Claude Code and Codex"
   echo "  xcsift     → compact xcodebuild/swift build output in Claude Code"
+  echo "  search     → ripgrep, fd, sd and ast-grep for fast code search and rewriting"
+  echo "  grepai     → semantic code search MCP in Claude Code, local Ollama embeddings"
   echo "  ponytail   → plugin in both Claude Code and Codex"
   echo "  evolver    → session hooks in both Claude Code and Codex"
   echo "  claude-mem → cross-session memory plugin in both, worker daemon on its own port"

@@ -4,7 +4,7 @@
 
 c_reset=$'\033[0m'; c_bold=$'\033[1m'; c_green=$'\033[32m'; c_yellow=$'\033[33m'
 c_red=$'\033[31m'; c_blue=$'\033[34m'
-ATS_VERSION=1.8.1
+ATS_VERSION=1.9.0
 
 section() { printf '\n%s== %s ==%s\n' "$c_bold$c_blue" "$1" "$c_reset"; }
 ok()      { printf '  %s✔%s %s\n' "$c_green" "$c_reset" "$1"; }
@@ -13,6 +13,20 @@ warn()    { printf '  %s!%s %s\n' "$c_red" "$c_reset" "$1"; }
 run()     { printf '  %s→%s %s\n' "$c_blue" "$c_reset" "$*"; "$@"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# brew_ensure COMMAND FORMULA — install FORMULA when COMMAND is missing,
+# upgrade it when brew reports it outdated, else skip. Failures warn and
+# return 1 so the caller can continue.
+brew_ensure() {
+  local command_name="$1" formula="$2"
+  if ! have "$command_name"; then
+    run brew install "$formula" || { warn "$formula install failed"; return 1; }
+  elif [ -n "$(brew outdated "$formula" 2>/dev/null)" ]; then
+    run brew upgrade "$formula" || { warn "$formula upgrade failed"; return 1; }
+  else
+    skip "$formula already up to date"
+  fi
+}
 
 # with_timeout SECONDS CMD... — runs CMD bounded by `timeout`/`gtimeout` when
 # either is on PATH. Falls back to running unbounded on a machine without

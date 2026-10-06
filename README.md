@@ -10,6 +10,8 @@ Rerun ATS to check installed tools, apply updates, and refresh agent integration
 - **headroom:** downstream compression proxy on `:8788`, plus an on-demand MCP server in Claude Code.
 - **rtk:** shell-output compression hook in both agents.
 - **xcsift:** when Xcode is installed, a Claude Code hook pipes `xcodebuild` and `swift build`/`swift test` through [xcsift](https://github.com/ldomaradzki/xcsift), after [Daniel Saidi's setup](https://danielsaidi.com/blog/2026/09/30/optimizing-claude-code-s-xcode-build-token-usage). ATS adds those commands to rtk's `exclude_commands` so the two hooks don't race to rewrite them.
+- **Search tools:** Homebrew `ripgrep`, `fd`, `sd` and `ast-grep`, installed or upgraded on each sync.
+- **grepai:** [semantic code search](https://github.com/yoanbernabeu/grepai) with local Ollama embeddings, registered as a user-scope MCP server in Claude Code. See [grepai](#grepai).
 - **ponytail:** lazy-coding plugin in both agents.
 - **Ship:** optional private plugin in both agents. ATS runs `ship-update` when installed or attempts installation through authenticated GitHub CLI. If access is unavailable, sync continues with the other tools.
 - **SkillOpt:** [Microsoft's skill optimizer](https://github.com/microsoft/SkillOpt), with the SkillOpt-Sleep plugin for Claude Code and skill for Codex CLI/Desktop. It runs on demand and stages learned changes for review.
@@ -103,6 +105,32 @@ For Codex learning runs, select `--source codex` and a Codex-visible
 `--target-skill-path .agents/skills/<name>/SKILL.md`. The fork also supports
 `--target-document-path` for discovered guidance or stage prompts, and
 `--memory-path` for secondary guidance such as `CLAUDE.local.md` or `AGENTS.md`.
+
+## grepai
+
+ATS installs `grepai` (from `yoanbernabeu/tap`) and `ollama` with Homebrew, runs Ollama from its own LaunchAgent (`au.com.beauayres.agent-tools-sync.ollama`, stopping the `brew services` one if registered) with `OLLAMA_KEEP_ALIVE=-1`, adds `.grepai/` to your global git excludes, and, when Claude Code is installed, runs `claude mcp add --scope user grepai -- grepai mcp-serve` unless `grepai` is already registered. The excludes file is whatever `core.excludesFile` points at; if none is set, ATS creates `~/.config/git/ignore` and sets the config. A repository's own `.gitignore` is never touched. ATS does not run `grepai init` or index any repository.
+
+The first sync that sets up grepai asks which embedding model to download:
+
+- `qwen3-embedding:8b` (recommended): best search quality, fast once loaded; about a 4.7 GB download, keeps about 9 GB of memory held while Ollama runs, best on Apple silicon with 16 GB or more.
+- `nomic-embed-text`: about a 274 MB download, runs on any Mac, lower search quality.
+
+The LaunchAgent exists because Ollama otherwise unloads the model after every request, and grepai sends no keep-alive: qwen3 took about 9 s per chunk that way, against 0.04 to 0.1 s with the model kept loaded. Homebrew regenerates its own service file on every start, so the environment can't be set there. After pulling, ATS sends one embed request to warm the model. Logs go to `~/Library/Logs/ollama.log`.
+
+The question uses the terminal (the bootstrap's open terminal, else `/dev/tty`). With no terminal, ATS pulls `nomic-embed-text` and says so; the next run in a terminal still asks. If the `qwen3-embedding:8b` pull fails, ATS warns, pulls `nomic-embed-text` and records it as active. Later syncs pull only the recorded model, and a failed update of a model you already have keeps it.
+
+The choice lives in `~/.caveman/ats-grepai.env` (or `$CAVEMAN_HOME`), beside ATS's stop marker. Delete the file to be asked again. It holds `GREPAI_MODEL`, `GREPAI_DIMENSIONS` (4096 for qwen3, 768 for nomic) and `GREPAI_ASKED`.
+
+To use grepai in a repository, run `grepai init --provider ollama --backend gob --yes`, then set the model in `.grepai/config.yaml` to match the file above. `grepai init` has no model flag for Ollama (it always writes `nomic-embed-text`, 768):
+
+```yaml
+embedder:
+    provider: ollama
+    model: qwen3-embedding:8b
+    dimensions: 4096
+```
+
+Run `grepai watch` to index. Change the model or dimensions only before indexing, or delete `.grepai/` and reindex; embeddings from different models are not comparable. ATS adds no agent instructions for these tools.
 
 ## Context7 and Serena
 
