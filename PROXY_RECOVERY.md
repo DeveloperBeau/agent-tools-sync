@@ -125,7 +125,7 @@ Install the Headroom revision pinned by `HEADROOM_FORK_SOURCE` in `lib/headroom.
 then restart Headroom directly:
 
 ```sh
-uv tool install --force --python 3.13 'headroom-ai[all] @ git+https://github.com/DeveloperBeau/headroom.git@7b1879a3fea42574b0d4b98eed25a24b29294867'
+uv tool install --force --python 3.13 'headroom-ai[all] @ git+https://github.com/DeveloperBeau/headroom.git@eb2ca262a2238d51db0d29af597111853a12de96'
 headroom install restart --profile default
 python3 /absolute/path/to/agent-tools-sync/lib/proxy_watchdog.py install
 ```
@@ -270,7 +270,7 @@ Disable the watchdog before replacing the fork:
 ```sh
 launchctl bootout gui/$(id -u)/au.com.beauayres.agent-tools-sync.proxy-watchdog
 rm ~/Library/LaunchAgents/au.com.beauayres.agent-tools-sync.proxy-watchdog.plist
-uv tool install --force --python 3.13 'headroom-ai[all]==0.39.1'
+uv tool install --force --python 3.13 'headroom-ai[all]==0.40.0'
 headroom install restart --profile default
 ```
 
