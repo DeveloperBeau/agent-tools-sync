@@ -17,7 +17,7 @@ grepai_fixture() {
   unset CAVEMAN_HOME
   GIT_CONFIG_GLOBAL="$HOME/.gitconfig"; export GIT_CONFIG_GLOBAL
   STUB="$HOME/stub"; mkdir -p "$STUB"
-  LOG="$HOME/calls"; export LOG BREW_OUTDATED BREW_FAIL OLLAMA_FAIL_PULL OLLAMA_LIST
+  LOG="$HOME/calls"; export LOG BREW_OUTDATED BREW_FAIL OLLAMA_FAIL_PULL OLLAMA_LIST BREW_SERVICES LAUNCHCTL_BOOTSTRAP_FAIL
   STATE="$HOME/.caveman/ats-grepai.env"
   cat >"$STUB/brew" <<'STUB'
 #!/usr/bin/env bash
@@ -25,7 +25,22 @@ printf 'brew %s\n' "$*" >>"$LOG"
 case "$1" in
   outdated) case " ${BREW_OUTDATED:-} " in *" $2 "*) echo "$2" ;; esac ;;
   install|upgrade) [ "${BREW_FAIL:-0}" -eq 0 ] ;;
+  services) if [ "$2" = list ]; then printf 'Name Status\n%s\n' "${BREW_SERVICES:-}"; fi ;;
 esac
+STUB
+  # print succeeds only while "loaded" exists; bootstrap/bootout toggle it.
+  cat >"$STUB/launchctl" <<'STUB'
+#!/usr/bin/env bash
+printf 'launchctl %s\n' "$*" >>"$LOG"
+case "$1" in
+  print) [ -e "$HOME/loaded" ] ;;
+  bootstrap) [ "${LAUNCHCTL_BOOTSTRAP_FAIL:-0}" -eq 0 ] && touch "$HOME/loaded" ;;
+  bootout) rm -f "$HOME/loaded" ;;
+esac
+STUB
+  cat >"$STUB/curl" <<'STUB'
+#!/usr/bin/env bash
+printf 'curl %s\n' "$*" >>"$LOG"
 STUB
   cat >"$STUB/ollama" <<'STUB'
 #!/usr/bin/env bash
@@ -82,7 +97,8 @@ prompt_text_and_reprompt() (
   err="$(cat "$HOME/err")"
   [[ "$err" == *"Which Ollama embedding model should grepai use?"* ]] || return 1
   [[ "$err" == *"1) qwen3-embedding:8b (recommended)"* ]] || return 1
-  [[ "$err" == *"About a 4.7 GB download, needs roughly 8 GB of"* ]] || return 1
+  [[ "$err" == *"Best search quality, fast once loaded. About a 4.7 GB download; keeps"* ]] || return 1
+  [[ "$err" == *"about 9 GB of memory held while Ollama runs."* ]] || return 1
   [[ "$err" == *"2) nomic-embed-text"* ]] || return 1
   [[ "$err" == *"About a 274 MB download, runs on any Mac, lower search quality."* ]] || return 1
   [[ "$err" == *"Enter 1 or 2."* ]] || return 1
@@ -156,12 +172,78 @@ brew_installs_and_starts_service() (
 )
 check "grepai: installs grepai and ollama when missing" brew_installs_and_starts_service
 
-starts_ollama_service() (
+PLIST="Library/LaunchAgents/au.com.beauayres.agent-tools-sync.ollama.plist"
+
+writes_launch_agent() (
   ANSWER=2; grepai_fixture
   setup_grepai >/dev/null 2>&1 3<&-
-  grep -qx "brew services start ollama" "$LOG"
+  p="$HOME/$PLIST"
+  grep -q "<string>$STUB/ollama</string><string>serve</string>" "$p" \
+    && grep -q '<key>OLLAMA_KEEP_ALIVE</key><string>-1</string>' "$p" \
+    && grep -q '<key>OLLAMA_FLASH_ATTENTION</key><string>1</string>' "$p" \
+    && grep -q '<key>OLLAMA_KV_CACHE_TYPE</key><string>q8_0</string>' "$p" \
+    && grep -q '<key>KeepAlive</key><true/>' "$p" && grep -q '<key>RunAtLoad</key><true/>' "$p" \
+    && grep -q "launchctl bootstrap gui/$(id -u) $p" "$LOG" \
+    && ! grep -q 'brew services start' "$LOG"
 )
-check "grepai: starts ollama with brew services" starts_ollama_service
+check "grepai: writes and bootstraps the Ollama LaunchAgent with keep-alive" writes_launch_agent
+
+launch_agent_unchanged_on_rerun() (
+  ANSWER=2; grepai_fixture
+  setup_grepai >/dev/null 2>&1 3<&-
+  before="$(cat "$HOME/$PLIST")"; : >"$LOG"
+  out="$(setup_grepai 2>&1 3<&-)"
+  [ "$(cat "$HOME/$PLIST")" = "$before" ] && ! grep -qE 'launchctl (bootstrap|bootout)' "$LOG" \
+    && [[ "$out" == *"LaunchAgent already running"* ]]
+)
+check "grepai: rerun leaves a matching LaunchAgent alone" launch_agent_unchanged_on_rerun
+
+changed_plist_reloaded() (
+  ANSWER=2; grepai_fixture
+  setup_grepai >/dev/null 2>&1 3<&-
+  printf 'stale\n' >"$HOME/$PLIST"; : >"$LOG"
+  setup_grepai >/dev/null 2>&1 3<&-
+  grep -q 'OLLAMA_KEEP_ALIVE' "$HOME/$PLIST" && grep -q 'launchctl bootout' "$LOG" && grep -q 'launchctl bootstrap' "$LOG"
+)
+check "grepai: a stale LaunchAgent is rewritten and reloaded" changed_plist_reloaded
+
+stops_brew_service() (
+  ANSWER=2; BREW_SERVICES="ollama started beau ~/x.plist"; grepai_fixture
+  setup_grepai >/dev/null 2>&1 3<&-
+  stop="$(grep -n '^brew services stop ollama' "$LOG" | cut -d: -f1)"
+  boot="$(grep -n '^launchctl bootstrap' "$LOG" | cut -d: -f1)"
+  [ -n "$stop" ] && [ -n "$boot" ] && [ "$stop" -lt "$boot" ]
+)
+check "grepai: a registered brew service is stopped before bootstrap" stops_brew_service
+
+leaves_absent_brew_service() (
+  ANSWER=2; BREW_SERVICES="ollama none"; grepai_fixture
+  setup_grepai >/dev/null 2>&1 3<&-
+  ! grep -q 'brew services stop' "$LOG"
+)
+check "grepai: an unregistered brew service is not touched" leaves_absent_brew_service
+
+bootstrap_failure_warns() (
+  ANSWER=2; LAUNCHCTL_BOOTSTRAP_FAIL=1; grepai_fixture
+  out="$(setup_grepai 2>&1 3<&-)"; status=$?
+  [ "$status" -ne 0 ] && [[ "$out" == *"could not start the Ollama LaunchAgent"* ]]
+)
+check "grepai: bootstrap failure warns and returns nonzero" bootstrap_failure_warns
+
+warms_chosen_model() (
+  ANSWER=1; grepai_fixture
+  setup_grepai >/dev/null 2>&1 3<&-
+  grep '^curl' "$LOG" | grep -q 'localhost:11434/api/embed' \
+    && grep '^curl' "$LOG" | grep -q '"model":"qwen3-embedding:8b"' && [ "$(grep -c '^curl' "$LOG")" -eq 1 ]
+)
+check "grepai: one warm-up embed request with the chosen model" warms_chosen_model
+
+warms_fallback_model() (
+  ANSWER=1; OLLAMA_FAIL_PULL=qwen3-embedding:8b; grepai_fixture
+  setup_grepai >/dev/null 2>&1 3<&-
+  grep '^curl' "$LOG" | grep -q '"model":"nomic-embed-text"' && ! grep -q 'qwen3' <(grep '^curl' "$LOG")
+)
+check "grepai: warm-up uses the fallback model after a failed pull" warms_fallback_model
 
 upgrades_outdated() (
   ANSWER=2; BREW_OUTDATED="yoanbernabeu/tap/grepai ollama"; grepai_fixture

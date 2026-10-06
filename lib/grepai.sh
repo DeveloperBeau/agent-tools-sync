@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# grepai.sh — install/update grepai and Ollama, start Ollama, keep .grepai/
+# grepai.sh — install/update grepai and Ollama, run Ollama from our own LaunchAgent, keep .grepai/
 # out of every repo via the global git excludes, register the grepai MCP
 # server in Claude Code, and pull the user's chosen embedding model.
 # ATS never runs `grepai init` or indexes a repository.
@@ -26,6 +26,71 @@ grepai_state_set() {
     "$1" "$(grepai_dimensions "$1")" "$2" >"$file"
 }
 
+GREPAI_OLLAMA_LABEL=au.com.beauayres.agent-tools-sync.ollama
+
+# grepai_ollama_plist — XML for a user LaunchAgent running `ollama serve`
+# with the model kept loaded. Homebrew regenerates its own plist on every
+# start, so the environment cannot be set durably through `brew services`.
+grepai_ollama_plist() {
+  cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$GREPAI_OLLAMA_LABEL</string>
+  <key>ProgramArguments</key><array><string>$1</string><string>serve</string></array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>OLLAMA_KEEP_ALIVE</key><string>-1</string>
+    <key>OLLAMA_FLASH_ATTENTION</key><string>1</string>
+    <key>OLLAMA_KV_CACHE_TYPE</key><string>q8_0</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$HOME/Library/Logs/ollama.log</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/ollama.log</string>
+</dict>
+</plist>
+PLIST
+}
+
+# grepai_ollama_service — stop the brew-managed service (it would fight for
+# port 11434) and run Ollama from our own LaunchAgent. No-op when current.
+grepai_ollama_service() {
+  local bin plist domain want
+  bin="$(command -v ollama)" || { warn "ollama not found"; return 1; }
+  plist="$HOME/Library/LaunchAgents/$GREPAI_OLLAMA_LABEL.plist"
+  domain="gui/$(id -u)"
+  want="$(grepai_ollama_plist "$bin")"
+  if [ "$(cat "$plist" 2>/dev/null)" = "$want" ] && launchctl print "$domain/$GREPAI_OLLAMA_LABEL" >/dev/null 2>&1; then
+    skip "Ollama LaunchAgent already running"
+    return 0
+  fi
+  if brew services list 2>/dev/null | awk '$1=="ollama" && $2!="none" {f=1} END {exit !f}'; then
+    run brew services stop ollama || { warn "could not stop the brew Ollama service"; return 1; }
+  fi
+  if ! { mkdir -p "$(dirname "$plist")" "$HOME/Library/Logs" && printf '%s\n' "$want" >"$plist"; }; then
+    warn "could not write $plist"; return 1
+  fi
+  launchctl bootout "$domain/$GREPAI_OLLAMA_LABEL" >/dev/null 2>&1
+  if ! run launchctl bootstrap "$domain" "$plist"; then
+    warn "could not start the Ollama LaunchAgent"; return 1
+  fi
+  launchctl print "$domain/$GREPAI_OLLAMA_LABEL" >/dev/null 2>&1 \
+    || { warn "Ollama LaunchAgent did not load"; return 1; }
+  ok "Ollama LaunchAgent running (model kept loaded)"
+}
+
+# grepai_warm MODEL — one embed request so the first index skips the load.
+grepai_warm() {
+  if with_timeout 300 curl -fsS http://localhost:11434/api/embed \
+      -d "{\"model\":\"$1\",\"input\":\"warm up\"}" >/dev/null 2>&1; then
+    ok "$1 warmed"
+  else
+    warn "could not warm $1; the first index will load it"
+  fi
+}
+
 # grepai_prompt — prints qwen3 or nomic. Reads fd 3 when install.sh opened
 # it, else the controlling terminal (ATS_TTY overrides, for tests). Returns 1
 # when there is no terminal.
@@ -36,8 +101,9 @@ grepai_prompt() {
   {
     printf '\nWhich Ollama embedding model should grepai use?\n'
     printf '  1) %s (recommended)\n' "$GREPAI_QWEN"
-    printf '     Best search quality. About a 4.7 GB download, needs roughly 8 GB of\n'
-    printf '     free memory while indexing, best on Apple silicon with 16 GB or more.\n'
+    printf '     Best search quality, fast once loaded. About a 4.7 GB download; keeps\n'
+    printf '     about 9 GB of memory held while Ollama runs. Best on Apple silicon with\n'
+    printf '     16 GB or more.\n'
     printf '  2) %s\n' "$GREPAI_NOMIC"
     printf '     About a 274 MB download, runs on any Mac, lower search quality.\n'
   } >&2
@@ -112,6 +178,7 @@ grepai_setup_model() {
   fi
   grepai_state_set "$model" "$asked" || { warn "could not record model choice"; return 1; }
   ok "embedding model: $model ($(grepai_dimensions "$model") dimensions)"
+  grepai_warm "$model"
 }
 
 setup_grepai() {
@@ -121,8 +188,11 @@ setup_grepai() {
   brew_ensure grepai yoanbernabeu/tap/grepai || failed=1
   brew_ensure ollama ollama || failed=1
   if have ollama; then
-    run brew services start ollama || { warn "could not start Ollama service"; failed=1; }
-    grepai_setup_model || failed=1
+    if grepai_ollama_service; then
+      grepai_setup_model || failed=1
+    else
+      failed=1
+    fi
   fi
   grepai_exclude || failed=1
   if have claude && have grepai; then

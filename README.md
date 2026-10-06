@@ -108,12 +108,14 @@ For Codex learning runs, select `--source codex` and a Codex-visible
 
 ## grepai
 
-ATS installs `grepai` (from `yoanbernabeu/tap`) and `ollama` with Homebrew, starts Ollama with `brew services start ollama`, adds `.grepai/` to your global git excludes, and, when Claude Code is installed, runs `claude mcp add --scope user grepai -- grepai mcp-serve` unless `grepai` is already registered. The excludes file is whatever `core.excludesFile` points at; if none is set, ATS creates `~/.config/git/ignore` and sets the config. A repository's own `.gitignore` is never touched. ATS does not run `grepai init` or index any repository.
+ATS installs `grepai` (from `yoanbernabeu/tap`) and `ollama` with Homebrew, runs Ollama from its own LaunchAgent (`au.com.beauayres.agent-tools-sync.ollama`, stopping the `brew services` one if registered) with `OLLAMA_KEEP_ALIVE=-1`, adds `.grepai/` to your global git excludes, and, when Claude Code is installed, runs `claude mcp add --scope user grepai -- grepai mcp-serve` unless `grepai` is already registered. The excludes file is whatever `core.excludesFile` points at; if none is set, ATS creates `~/.config/git/ignore` and sets the config. A repository's own `.gitignore` is never touched. ATS does not run `grepai init` or index any repository.
 
 The first sync that sets up grepai asks which embedding model to download:
 
-- `qwen3-embedding:8b` (recommended): best search quality; about a 4.7 GB download, needs roughly 8 GB of free memory while indexing, best on Apple silicon with 16 GB or more.
+- `qwen3-embedding:8b` (recommended): best search quality, fast once loaded; about a 4.7 GB download, keeps about 9 GB of memory held while Ollama runs, best on Apple silicon with 16 GB or more.
 - `nomic-embed-text`: about a 274 MB download, runs on any Mac, lower search quality.
+
+The LaunchAgent exists because Ollama otherwise unloads the model after every request, and grepai sends no keep-alive: qwen3 took about 9 s per chunk that way, against 0.04 to 0.1 s with the model kept loaded. Homebrew regenerates its own service file on every start, so the environment can't be set there. After pulling, ATS sends one embed request to warm the model. Logs go to `~/Library/Logs/ollama.log`.
 
 The question uses the terminal (the bootstrap's open terminal, else `/dev/tty`). With no terminal, ATS pulls `nomic-embed-text` and says so; the next run in a terminal still asks. If the `qwen3-embedding:8b` pull fails, ATS warns, pulls `nomic-embed-text` and records it as active. Later syncs pull only the recorded model, and a failed update of a model you already have keeps it.
 
