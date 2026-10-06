@@ -14,6 +14,20 @@ run()     { printf '  %s→%s %s\n' "$c_blue" "$c_reset" "$*"; "$@"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# brew_ensure COMMAND FORMULA — install FORMULA when COMMAND is missing,
+# upgrade it when brew reports it outdated, else skip. Failures warn and
+# return 1 so the caller can continue.
+brew_ensure() {
+  local command_name="$1" formula="$2"
+  if ! have "$command_name"; then
+    run brew install "$formula" || { warn "$formula install failed"; return 1; }
+  elif [ -n "$(brew outdated "$formula" 2>/dev/null)" ]; then
+    run brew upgrade "$formula" || { warn "$formula upgrade failed"; return 1; }
+  else
+    skip "$formula already up to date"
+  fi
+}
+
 # with_timeout SECONDS CMD... — runs CMD bounded by `timeout`/`gtimeout` when
 # either is on PATH. Falls back to running unbounded on a machine without
 # coreutils (this repo is meant to be portable). Use for any network call
