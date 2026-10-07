@@ -1,6 +1,6 @@
 # agent-tools-sync
 
-ATS installs and updates [headroom](https://github.com/headroomlabs-ai/headroom), [rtk](https://github.com/rtk-ai/rtk), [caveman](https://github.com/JuliusBrussee/caveman), and [ponytail](https://github.com/DietrichGebert/ponytail) for [Claude Code](https://claude.com/claude-code) and [Codex CLI](https://github.com/openai/codex).
+ATS installs and updates for the tools I use alongside [Claude Code](https://claude.com/claude-code) and [Codex CLI](https://github.com/openai/codex).
 
 Rerun ATS to check installed tools, apply updates, and refresh agent integrations.
 
