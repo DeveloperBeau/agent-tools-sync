@@ -2,7 +2,7 @@
 # evolver.sh — install/update evolver (github.com/EvoMap/evolver), wire its
 # session hooks into both Claude Code and Codex via `evolver setup-hooks`.
 # No proxy/daemon component — it's a CLI invoked on demand by those hooks —
-# so unlike headroom/caveman it has nothing for cmd_kill/cmd_start to manage.
+# so unlike caveman it has nothing for cmd_kill/cmd_start to manage.
 
 # evolver_claude_hook_installed SETTINGS_JSON_TEXT — 0 if Claude Code's
 # settings.json already references evolver's hook scripts.

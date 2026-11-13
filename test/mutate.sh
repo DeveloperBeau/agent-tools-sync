@@ -18,67 +18,6 @@ ROOT="$(cd "$HERE/.." && pwd)"
 MUT_LIB=(); MUT_TEST=(); MUT_DESC=(); MUT_OLD=(); MUT_NEW=()
 mutant() { MUT_LIB+=("$1"); MUT_TEST+=("$2"); MUT_DESC+=("$3"); MUT_OLD+=("$4"); MUT_NEW+=("$5"); }
 
-# ---------------------------------------------------------------- headroom --
-mutant lib/headroom.sh test/test_headroom.sh \
-  "profile_exists: invert the 'Profile:' branch" \
-  '*"Profile:"*)                    return 0 ;;' \
-  '*"Profile:"*)                    return 1 ;;'
-
-mutant lib/headroom.sh test/test_headroom.sh \
-  "profile_port: wrong awk field (\$1 instead of \$2)" \
-  "awk -F': *' '/^Port:/{print \$2; exit}'" \
-  "awk -F': *' '/^Port:/{print \$1; exit}'"
-
-mutant lib/headroom.sh test/test_headroom.sh \
-  "is_healthy: revert to the open-ended (buggy) match" \
-  "grep -qE '^Status:[[:space:]]+running[[:space:]]*\$'" \
-  "grep -q '^Status:.*running'"
-
-mutant lib/headroom.sh test/test_headroom.sh \
-  "deployment_action: flip the port-mismatch comparison" \
-  'if [ "$(headroom_profile_port "$status_text")" != "$desired_port" ]; then' \
-  'if [ "$(headroom_profile_port "$status_text")" = "$desired_port" ]; then'
-
-mutant lib/headroom.sh test/test_headroom.sh \
-  "deployment_action: always report healthy instead of start" \
-  'echo "start"' \
-  'echo "healthy"'
-
-mutant lib/headroom.sh test/test_headroom.sh \
-  "codex_routed/mcp_registered: search for the wrong marker" \
-  "grep -qi 'headroom'" \
-  "grep -qi 'nonexistent-marker-xyz'"
-
-mutant lib/headroom.sh test/test_headroom.sh \
-  "rc_has_leaked_anthropic_url: never reset inblock, so any later export counts" \
-  '/^# <<< headroom persistent env <<</ { inblock=0 }' \
-  '/^# <<< headroom persistent env <<</ { inblock=inblock }'
-
-mutant lib/headroom.sh test/test_headroom.sh \
-  "fix_rc_file: stop actually skipping the leaked line (rewrite becomes a no-op)" \
-  'inblock && /^export (ANTHROPIC|OPENAI)_BASE_URL=/ { next }' \
-  'inblock && /^export (ANTHROPIC|OPENAI)_BASE_URL=/ { }'
-
-mutant lib/headroom.sh test/test_headroom.sh \
-  "manifest_routes_agents: loosen to any key containing BASE_URL" \
-  "grep -qE '\"(ANTHROPIC|OPENAI)_BASE_URL\"'" \
-  "grep -q 'BASE_URL'"
-
-mutant lib/headroom.sh test/test_headroom.sh \
-  "manifest_routes_agents: watch only the claude half of the leak" \
-  "grep -qE '\"(ANTHROPIC|OPENAI)_BASE_URL\"'" \
-  "grep -qE '\"ANTHROPIC_BASE_URL\"'"
-
-mutant lib/headroom.sh test/test_headroom.sh \
-  "effective_action: drop the manifest override (leak survives every start)" \
-  'if [ "$1" != reapply ] && headroom_manifest_routes_agents "$2"; then' \
-  'if [ "$1" != reapply ] && false; then'
-
-mutant lib/headroom.sh test/test_headroom.sh \
-  "effective_action: override everything, not just leaky manifests" \
-  'if [ "$1" != reapply ] && headroom_manifest_routes_agents "$2"; then' \
-  'if [ "$1" != reapply ]; then'
-
 # --------------------------------------------------------------------- rtk --
 mutant lib/rtk.sh test/test_rtk.sh \
   "claude_hook_installed: loosen back to a bare substring match" \

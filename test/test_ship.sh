@@ -71,4 +71,70 @@ ship_without_gh_nonfatal() (
 )
 check "Ship skipped without GitHub CLI" ship_without_gh_nonfatal
 
+ship_fake_swift() {
+  mkdir -p "$HOME/bin"
+  cat >"$HOME/bin/swift" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$SHIP_TEST_LOG"
+EOF
+  chmod +x "$HOME/bin/swift"
+  PATH="$HOME/bin:/usr/bin:/bin"
+  export PATH
+}
+
+ship_update_builds_ship_product() (
+  ship_fixture
+  ship_fake_swift
+  mkdir -p "$HOME/.local/bin"
+  cat >"$HOME/.local/bin/ship-update" <<'EOF'
+#!/usr/bin/env bash
+swift build -c release
+EOF
+  chmod +x "$HOME/.local/bin/ship-update"
+  setup_ship >/dev/null
+  [ "$(cat "$SHIP_TEST_LOG")" = "build -c release --product ship" ]
+)
+check "Ship update builds the ship product" ship_update_builds_ship_product
+
+ship_update_keeps_named_product() (
+  ship_fixture
+  ship_fake_swift
+  mkdir -p "$HOME/.local/bin"
+  cat >"$HOME/.local/bin/ship-update" <<'EOF'
+#!/usr/bin/env bash
+swift build -c release --product ship
+EOF
+  chmod +x "$HOME/.local/bin/ship-update"
+  setup_ship >/dev/null
+  [ "$(cat "$SHIP_TEST_LOG")" = "build -c release --product ship" ]
+)
+check "Ship update keeps a build that already names a product" ship_update_keeps_named_product
+
+ship_install_builds_ship_product() (
+  ship_fixture
+  ship_fake_swift
+  cat >"$HOME/installer" <<'EOF'
+#!/usr/bin/env bash
+swift build -c release
+EOF
+  setup_ship >/dev/null
+  [ "$(cat "$SHIP_TEST_LOG")" = "build -c release --product ship" ]
+)
+check "Ship install builds the ship product" ship_install_builds_ship_product
+
+ship_other_swift_commands_stay() (
+  ship_fixture
+  ship_fake_swift
+  ship_with_product swift test --filter Foo
+  [ "$(cat "$SHIP_TEST_LOG")" = "test --filter Foo" ]
+)
+check "Other swift commands stay unchanged" ship_other_swift_commands_stay
+
+check "ship_developer_dir: a set DEVELOPER_DIR wins" bash -c '
+  source "$1"; [ "$(DEVELOPER_DIR=/custom ship_developer_dir)" = /custom ]' bash "$HERE/../lib/ship.sh"
+check "ship_developer_dir: otherwise the plain Xcode.app" bash -c '
+  source "$1"; unset DEVELOPER_DIR
+  [ ! -d /Applications/Xcode.app/Contents/Developer ] ||
+    [ "$(ship_developer_dir)" = /Applications/Xcode.app/Contents/Developer ]' bash "$HERE/../lib/ship.sh"
+
 report
