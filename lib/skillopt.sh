@@ -155,7 +155,7 @@ setup_skillopt() {
     warn "SkillOpt checkout unavailable; continuing"
     return 0
   fi
-  if ! run with_timeout 300 uv tool install --force --python 3.13 --editable "$repo"; then
+  if ! run with_timeout 300 uv tool install --quiet --force --python 3.13 --editable "$repo"; then
     warn "SkillOpt engine install failed; continuing"
     return 0
   fi

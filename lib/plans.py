@@ -83,7 +83,7 @@ def vault_lock(vault):
     path = vault / ".ats-plans.lock"
     fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w") as stream:
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + 10
         while True:
             try:
                 fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -390,7 +390,7 @@ def hooks(data, command, agent):
         events.setdefault(event, []).append(
             {
                 "matcher": matcher,
-                "hooks": [{"type": "command", "command": command, "timeout": 5}],
+                "hooks": [{"type": "command", "command": command, "timeout": 20}],
             }
         )
     return json.dumps(data, indent=2, ensure_ascii=False) + "\n"

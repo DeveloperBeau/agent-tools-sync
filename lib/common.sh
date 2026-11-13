@@ -14,6 +14,20 @@ run()     { printf '  %s→%s %s\n' "$c_blue" "$c_reset" "$*"; "$@"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# python3 — shadow the system python3 (3.9 on macOS) with the newest 3.11+
+# interpreter on PATH; tomllib and hashlib.file_digest need it. Falls back to
+# plain python3 when none is found.
+python3() {
+  local v
+  for v in 3.14 3.13 3.12 3.11; do
+    if command -v "python$v" >/dev/null 2>&1; then command "python$v" "$@"; return; fi
+  done
+  command python3 "$@"
+}
+
+# Keep brew quiet and non-interactive: no y/n prompt, hints or download bars.
+export HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 NONINTERACTIVE=1
+
 # brew_ensure COMMAND FORMULA — install FORMULA when COMMAND is missing,
 # upgrade it when brew reports it outdated, else skip. Failures warn and
 # return 1 so the caller can continue.

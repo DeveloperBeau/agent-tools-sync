@@ -13,7 +13,7 @@ Rerun ATS to check installed tools, apply updates, and refresh agent integration
 - **Search tools:** Homebrew `ripgrep`, `fd`, `sd` and `ast-grep`, installed or upgraded on each sync.
 - **grepai:** [semantic code search](https://github.com/yoanbernabeu/grepai) with local Ollama embeddings, registered as a user-scope MCP server in Claude Code. See [grepai](#grepai).
 - **ponytail:** lazy-coding plugin in both agents.
-- **Ship:** optional private plugin in both agents. ATS runs `ship-update` when installed or attempts installation through authenticated GitHub CLI. If access is unavailable, sync continues with the other tools.
+- **Ship:** optional private plugin in both agents. ATS runs `ship-update` when installed or attempts installation through authenticated GitHub CLI. The Swift build names the `ship` product, so `ShipTestHelper` is not compiled. If access is unavailable, sync continues with the other tools.
 - **SkillOpt:** [Microsoft's skill optimizer](https://github.com/microsoft/SkillOpt), with the SkillOpt-Sleep plugin for Claude Code and skill for Codex CLI/Desktop. It runs on demand and stages learned changes for review.
 - **Context7:** [current library documentation](https://github.com/upstash/context7), registered as a remote HTTP MCP server for installed agents.
 - **Serena:** [semantic code navigation and editing](https://github.com/oraios/serena), installed through uv and registered as a local stdio MCP server for installed agents.

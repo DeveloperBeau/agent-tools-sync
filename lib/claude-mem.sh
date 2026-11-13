@@ -72,7 +72,7 @@ claude_mem_ensure_codex() {
     return
   fi
   if [ -n "$root" ]; then
-    if run npm install --omit=dev --prefix "$root" && claude_mem_runtime_ready "$root"; then
+    if run npm install --omit=dev --no-audit --no-fund --loglevel=error --prefix "$root" && claude_mem_runtime_ready "$root"; then
       ok "Codex integration runtime dependencies repaired"
     else
       warn "Codex integration dependency repair failed"
