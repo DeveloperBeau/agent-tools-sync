@@ -6,8 +6,7 @@ Rerun ATS to check installed tools, apply updates, and refresh agent integration
 
 ## What it sets up
 
-- **caveman:** proxy on `:8787`, plus agent hooks, skills, and MCP recovery. It forwards requests through headroom.
-- **headroom:** downstream compression proxy on `:8788`, plus an on-demand MCP server in Claude Code.
+- **caveman:** proxy on `:8787`, plus agent hooks, skills, and MCP recovery. Both agents use its native routes.
 - **rtk:** shell-output compression hook in both agents.
 - **xcsift:** when Xcode is installed, a Claude Code hook pipes `xcodebuild` and `swift build`/`swift test` through [xcsift](https://github.com/ldomaradzki/xcsift), after [Daniel Saidi's setup](https://danielsaidi.com/blog/2026/09/30/optimizing-claude-code-s-xcode-build-token-usage). ATS adds those commands to rtk's `exclude_commands` so the two hooks don't race to rewrite them.
 - **Search tools:** Homebrew `ripgrep`, `fd`, `sd` and `ast-grep`, installed or upgraded on each sync.
@@ -19,9 +18,9 @@ Rerun ATS to check installed tools, apply updates, and refresh agent integration
 - **Serena:** [semantic code navigation and editing](https://github.com/oraios/serena), installed through uv and registered as a local stdio MCP server for installed agents.
 - **Obsidian plans:** optional shared Markdown vault with plan capture and project indexes. Setup is off by default; enable it with `ATS_OBSIDIAN_PLANS=1`.
 
-Requests follow `agent → caveman (:8787) → headroom (:8788) → provider`. ATS configures a `compat.headroom` mount in `~/.caveman/caveman.yaml` and permits the loopback hop through `CAVE_SSRF_ALLOWLIST`.
+Requests follow `agent → caveman (:8787) → provider`. ATS points Claude's `ANTHROPIC_BASE_URL` at `http://127.0.0.1:8787/w/claude` and Codex's `model_providers.caveman.base_url` at `http://127.0.0.1:8787/chatgpt`. These are Caveman's own routes, so `caveman enable` and `caveman doctor` keep working. ATS replaces any older `/compat/headroom` URL with the native route.
 
-ATS points Claude's `ANTHROPIC_BASE_URL` and Codex's `model_providers.caveman.base_url` at that mount. Caveman may then report its native integrations as "degraded" because ATS changed the files it fingerprints. ATS recognizes this routing configuration and leaves it in place.
+Claude Code allows Remote Control only for `api.anthropic.com`. To use it, run `ats --no-wrap`. That removes the Claude route and the first-party flag that Caveman wrote with it, so `caveman doctor` reports Claude as degraded until a plain `ats` restores them. Restart open Claude sessions after each switch.
 
 ## Install
 
@@ -53,40 +52,28 @@ You can copy the directory to another machine and symlink the entry point. The s
 ## Usage
 
 ```sh
-ats            # install/update tools and enabled integrations, full proxy chain
-ats --no-headroom               # same sync, agents → Caveman → provider
-ats --no-caveman                # same sync, agents → Headroom → provider
-ats --no-headroom --no-caveman  # same sync, agents → provider (direct)
-ats kill       # stop both proxies and the memory worker
-ats start      # start both proxies and the memory worker, without full sync
-ats watchdog capture  # save incident evidence without restarting
-ats watchdog fire     # force Headroom recovery, ignoring detection/cooldown
+ats             # install/update tools and enabled integrations, Caveman proxy on
+ats --no-wrap   # same sync, no proxy, agents → provider (direct, Claude Remote Control works)
+ats kill           # stop the proxy and the memory worker
+ats start          # start the proxy and the memory worker, without full sync
 ```
 
-`ats` checks the Git checkout's upstream first. A clean checkout fast-forwards and restarts the updated script before integrations start. Offline, dirty, or diverged checkouts continue with their local version. Full sync starts the proxy chain after setup. `ats start` skips updates and waits for Headroom readiness before starting Caveman, then starts the installed memory-worker runtime. An existing memory worker stays running, preserving its provider backoff.
+`ats` checks the Git checkout's upstream first. A clean checkout fast-forwards and restarts the updated script before integrations start. Offline, dirty, or diverged checkouts continue with their local version. Full sync starts the proxy after setup. `ats start` skips updates, starts Caveman, then starts the installed memory-worker runtime. An existing memory worker stays running, preserving its provider backoff.
 
-For proxy-only startup that leaves the memory worker and the installed Headroom fork alone, use `bash proxy-chain.sh`. It preserves healthy processes and starts the existing Headroom deployment only if its port is not listening. See [chain verification](PROXY_CHAIN.md) for agent environment exports and separate compression measurements.
+For proxy-only startup that leaves the memory worker alone, use `bash proxy-chain.sh`. It preserves a healthy proxy. See [chain verification](PROXY_CHAIN.md) for agent environment exports and compression measurements.
 
-During full sync, ATS checks tool updates before setup. Headroom stays pinned to the diagnostic fork; upstream release checks report updates without replacing it. Installing a new pinned Headroom revision or updating Caveman restarts its running proxy. CLI hooks use updated executables on their next invocation. Existing agent sessions and the claude-mem worker keep running.
+During full sync, ATS checks tool updates before setup. Updating Caveman restarts its running proxy. CLI hooks use updated executables on their next invocation. Existing agent sessions and the claude-mem worker keep running.
 
 The ATS-managed Caveman hook bridge removes unsupported context output from Codex `PostCompact` callbacks while preserving lifecycle recording, warnings, and stop controls. Codex restores Caveman context through its supported `SessionStart` callback with `source: compact`. This correction survives vendor CLI updates.
 
-Optional standalone watchdog records separate Claude and ChatGPT Codex route health, captures incident evidence, and performs bounded Headroom recovery. It respects deliberate proxy stops and can capture reports manually. See [proxy recovery instructions](PROXY_RECOVERY.md) for installation, upstream fork maintenance, and rollback. ATS does not install or activate the watchdog automatically.
-
-The proxy flags select a mode, and ATS keeps the mode in `~/.caveman/ats-mode` (or `$CAVEMAN_HOME`). A plain `ats` run removes the file and restores the full chain. The sync does not install or update a skipped proxy. It stops the skipped proxy and points Claude Code and Codex at the first hop that remains. ATS changes only base URLs that it manages, and keeps a custom URL. `ats start` and `proxy-chain.sh start` start only the proxies that the mode uses. The watchdog does not restart Headroom in the `no-headroom` or `direct` mode. The Caveman wrapper skips native hooks in the `no-caveman` or `direct` mode. Restart open agent sessions after a mode change, because a session keeps the route that it started with.
+ATS keeps the proxy mode in `~/.caveman/ats-mode` (or `$CAVEMAN_HOME`). A plain `ats` run removes the file and restores the Caveman proxy. With `--no-wrap`, ATS stops the proxy and points Claude Code and Codex at their providers. ATS changes only base URLs that it manages, and keeps a custom URL. Restart open agent sessions after a mode change, because a session keeps the route that it started with. The older `no-headroom` mode file value means `full`. The older `no-caveman` value means `direct`. The older `--no-headroom` and `--no-caveman` flags no longer exist.
 
 | Mode | Claude Code base URL | Codex base URL |
 |---|---|---|
-| full | `http://127.0.0.1:8787/compat/headroom` | `http://127.0.0.1:8787/compat/headroom` |
-| no-headroom | `http://127.0.0.1:8787/w/claude` | `http://127.0.0.1:8787/chatgpt` |
-| no-caveman | `http://127.0.0.1:8788` | `http://127.0.0.1:8788` |
+| full | `http://127.0.0.1:8787/w/claude` | `http://127.0.0.1:8787/chatgpt` |
 | direct | none (Anthropic) | `https://chatgpt.com/backend-api/codex` |
 
-`ats kill` records stop intent in `~/.caveman/ats-stopped` before stopping services. The ATS-managed Caveman wrapper silently skips native hooks while stopped, and the watchdog honors the marker even before Headroom is unloaded. `ats start`, full `ats` sync, and `proxy-chain.sh start` clear the marker. Shutdown waits for in-progress watchdog work under the same control lock, then waits for identified Caveman listeners, escalates only those PIDs when needed, and preserves unknown processes. Lock acquisition waits up to three minutes. Failed shutdown or unavailable process inspection returns a failing command status.
-
-If `headroom install restart` fails, the watchdog loads the Headroom LaunchAgent again. A failed restart can leave the job unloaded, and launchd then does not restart it. The incident report keeps the last line of the restart error and the result of the reload.
-
-`ats watchdog fire` captures evidence before restarting Headroom, bypasses the automatic detection threshold and restart cooldown, and fails if restart or readiness fails. It preserves deliberate stop intent; run `ats start` first when stopped. Restart interrupts active proxy requests. Manual recovery shares a state lock with daemon polling and shutdown. If busy, it reports the wait and allows up to three minutes for the current operation to finish, then reads fresh state and checks stop intent before recovery. A lock timeout fails without a restart. If an older watchdog is still running, reload its LaunchAgent using the installation command in [proxy recovery instructions](PROXY_RECOVERY.md) before using `fire`.
+`ats kill` records stop intent in `~/.caveman/ats-stopped` before stopping services. `ats start`, full `ats` sync, and `proxy-chain.sh start` clear the marker. Shutdown waits for identified Caveman listeners, escalates only those PIDs when needed, and preserves unknown processes. Lock acquisition waits up to three minutes. Failed shutdown or unavailable process inspection returns a failing command status. ATS uses Caveman's own vendor binaries, so Caveman's native hooks can start the proxy again after `ats kill` or in `--no-wrap` mode. In `--no-wrap` mode nothing routes through it.
 
 If hooks report `Too many open files (os error 24)`, inspect the agent process rather than restarting proxies. Codex's shared daemon can exhaust its inherited descriptor limit, affecting skill scans and command spawning as well as hooks. See [descriptor troubleshooting](PROXY_RECOVERY.md#codex-hook-descriptor-exhaustion).
 
@@ -172,8 +159,7 @@ Start a new agent session after registration. Serena finds the nearest ancestor
 with `.serena/project.yml` or `.git` from the agent's working directory. If
 Codex Desktop starts elsewhere, ask: “Activate the current dir as project using
 serena.” Project configuration and language-server availability remain managed
-by Serena. These MCP sessions belong to the agents; `ats start`, `ats kill`,
-and the proxy watchdog do not manage them.
+by Serena. These MCP sessions belong to the agents; `ats start` and `ats kill` do not manage them.
 
 ## Shared plans and Obsidian
 

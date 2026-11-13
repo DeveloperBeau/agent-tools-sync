@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # claude-mem.sh — install/wire claude-mem (persistent cross-session memory,
 # github.com/thedotmack/claude-mem) into both Claude Code and Codex, and
-# manage its worker daemon alongside caveman/headroom's proxies.
+# manage its worker daemon alongside the caveman proxy.
 #
 # Claude Code uses the same marketplace-add + plugin-install pattern as
 # ponytail.sh. Codex has no plugin marketplace support in claude-mem — it
 # ships its own installer (`npx claude-mem install --ide codex-cli`) instead.
 #
 # The worker daemon (worker-service.cjs, Bun-managed) is a real background
-# server like caveman-proxy/headroom, so cmd_kill/cmd_start manage it too.
+# server like caveman-proxy, so cmd_kill/cmd_start manage it too.
 # Use the installed runtime's native lifecycle commands; npx may resolve a
 # stale marketplace copy instead of the plugin actually loaded by the host.
 

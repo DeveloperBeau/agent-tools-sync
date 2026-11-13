@@ -81,14 +81,13 @@ proxy_suspend() {
 }
 proxy_resume() { rm -f "$(proxy_stop_marker)"; }
 
-# The proxy mode persists between runs. It is full (both proxies) when the
-# file is absent, else no-headroom, no-caveman or direct (no proxies).
+# The proxy mode persists between runs. It is full (Caveman native routes) when
+# the file is absent, else direct (no proxy). An older no-headroom value means
+# full, and an older no-caveman value means direct, since Headroom is gone.
 ats_mode_file() { printf '%s/ats-mode\n' "${CAVEMAN_HOME:-$HOME/.caveman}"; }
 ats_mode() {
   case "$(cat "$(ats_mode_file)" 2>/dev/null)" in
-    no-headroom) echo no-headroom ;;
-    no-caveman) echo no-caveman ;;
-    direct) echo direct ;;
+    direct|no-caveman) echo direct ;;
     *) echo full ;;
   esac
 }
@@ -98,21 +97,19 @@ ats_set_mode() {
   if [ "$1" = full ]; then rm -f "$file"; return; fi
   (umask 077; mkdir -p "$(dirname "$file")" && printf '%s\n' "$1" > "$file")
 }
-# ats_uses headroom|caveman — 0 if the current mode runs that proxy.
+# ats_uses caveman — 0 if the current mode runs the Caveman proxy.
 ats_uses() {
-  case "$1:$(ats_mode)" in
-    headroom:no-headroom|headroom:direct|caveman:no-caveman|caveman:direct) return 1 ;;
-  esac
+  [ "$1:$(ats_mode)" != caveman:direct ]
 }
 
 # flock belongs to the inherited open-file description. The shell retains it
 # after Python exits, then closes it when this subshell returns.
 proxy_control_run() (
   umask 077
-  mkdir -p "$HOME/.headroom" || return 1
-  exec 9>>"$HOME/.headroom/watchdog-state.control.lock" || return 1
+  mkdir -p "${CAVEMAN_HOME:-$HOME/.caveman}" || return 1
+  exec 9>>"${CAVEMAN_HOME:-$HOME/.caveman}/ats-control.lock" || return 1
   python3 -c 'import fcntl, signal; signal.alarm(180); fcntl.flock(9, fcntl.LOCK_EX)' || {
-    warn "could not acquire watchdog control lock"
+    warn "could not acquire control lock"
     return 1
   }
   # Keep the shell's saved descriptor open without passing it to service CLIs.

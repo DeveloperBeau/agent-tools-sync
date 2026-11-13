@@ -4,30 +4,26 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/harness.sh"
 source "$HERE/../lib/common.sh"
 source "$HERE/../lib/caveman.sh"
-source "$HERE/../lib/headroom.sh"
 # Load only command definitions, without executing setup or update checks.
 eval "$(sed -n '/^cmd_kill()/,$p' "$HERE/../agent-tools-sync.sh" | sed '$d')"
 
 kill_intent() (
-  order="" HEADROOM_PORT=8788
+  order=""
   proxy_suspend() { order="${order}Q"; }
   proxy_control_run() { "$@"; }
   caveman_stop_proxy() { order="${order}C"; }
-  headroom_stop_proxy() { order="${order}H"; }
   claude_mem_stop_worker() { order="${order}M"; }
   port_listening() { return 1; }
   sleep() { :; }
   cmd_kill >/dev/null || return 1
-  [ "$order" = QCHM ]
+  [ "$order" = QCM ]
 )
 check 'kill records persistent stop before signals and also stops memory worker' kill_intent
 
 failed_stop() (
-  HEADROOM_PORT=8788
   proxy_suspend() { :; }
   proxy_control_run() { "$@"; }
   caveman_stop_proxy() { return 1; }
-  headroom_stop_proxy() { :; }
   claude_mem_stop_worker() { :; }
   port_listening() { return 1; }
   sleep() { :; }
@@ -65,57 +61,16 @@ unknown_listener() (
 )
 check 'Caveman stop refuses unrelated listener without signaling it' unknown_listener
 
-manual_dispatch() (
-  SCRIPT_DIR=/fixture
-  python3() { [ "$*" = '/fixture/lib/proxy_watchdog.py fire' ]; }
-  main watchdog fire >/dev/null
-)
-check 'ats watchdog fire dispatches directly to existing watchdog' manual_dispatch
-
 inspection_failure() (
-  HEADROOM_PORT=8788
   proxy_suspend() { :; }
   proxy_control_run() { "$@"; }
   caveman_stop_proxy() { :; }
-  headroom_stop_proxy() { :; }
   claude_mem_stop_worker() { :; }
   port_listening() { return 2; }
   sleep() { :; }
   ! cmd_kill >/dev/null
 )
 check 'kill cannot claim cleared ports when inspection failed' inspection_failure
-
-headroom_stop_check() (
-  local mode="$1" polls=0
-  HEADROOM_PORT=8788
-  have() { return 0; }
-  headroom_profile_exists() { return 0; }
-  headroom() { return 0; }
-  with_timeout() { shift; "$@"; }
-  port_listening() {
-    polls=$((polls + 1))
-    [ "$mode" = inspection-error ] && return 2
-    [ "$mode" = stuck ] && return 0
-    [ "$polls" -lt 3 ]
-  }
-  sleep() { :; }
-  if [ "$mode" = drained ]; then
-    headroom_stop_proxy >/dev/null && [ "$polls" = 3 ]
-  else
-    ! headroom_stop_proxy >/dev/null
-  fi
-)
-check 'Headroom stop waits for listener shutdown' headroom_stop_check drained
-check 'Headroom stop fails when listener stays bound' headroom_stop_check stuck
-check 'Headroom stop fails when listener inspection fails' headroom_stop_check inspection-error
-
-headroom_status_failure() (
-  have() { return 0; }
-  headroom() { return 1; }
-  with_timeout() { shift; "$@"; }
-  ! headroom_stop_proxy >/dev/null
-)
-check 'Headroom status failure cannot imply deployment is stopped' headroom_status_failure
 
 common_probe_error() (
   lsof() { printf 'lsof: Cannot get process list\n' >&2; return 1; }
@@ -129,14 +84,12 @@ full_sync_start() (
   shift 2
   CAVEMAN_HOME="$(mktemp -d)"
   trap 'rm -rf "$CAVEMAN_HOME"' EXIT
-  SCRIPT_DIR=/fixture HEADROOM_PORT=8788
+  SCRIPT_DIR=/fixture
   caveman_route_agents() { order="${order}[$1]"; }
   proxy_control_run() { "$@"; }
-  headroom_stop_proxy() { order="${order}h"; }
   caveman_stop_proxy() { order="${order}c"; }
   python3() { order="${order}W"; }
   proxy_resume() { order="${order}R"; }
-  setup_headroom() { order="${order}H"; }
   setup_rtk() { :; }
   setup_caveman() { order="${order}C"; }
   setup_ponytail() { :; }
@@ -153,18 +106,18 @@ full_sync_start() (
   status=$?
   [ "$status" = "$result" ] && [ "$order" = "$expected" ] || { echo "$order"; return 1; }
 )
-check 'full sync starts existing chain after setup' full_sync_start 0 "RHC7NO[full]S"
-check 'full sync propagates chain startup failure' full_sync_start 1 "RHC7NO[full]S"
-check 'no-headroom skips Headroom setup and stops it' full_sync_start 0 "RC7NO[no-headroom]hS" --no-headroom
-check 'no-caveman skips Caveman setup, refreshes its wrapper, stops it' full_sync_start 0 "RHW7NO[no-caveman]cS" --no-caveman
-check 'both flags give direct mode with both proxies stopped' full_sync_start 0 "RW7NO[direct]hcS" --no-headroom --no-caveman
+check 'full sync starts the proxy after setup' full_sync_start 0 "RC7NO[full]S"
+check 'full sync propagates proxy startup failure' full_sync_start 1 "RC7NO[full]S"
+check 'no-wrap skips Caveman setup and stops it' full_sync_start 0 "R7NO[direct]cS" --no-wrap
+check_fail 'older --no-caveman flag is rejected' full_sync_start 0 "" --no-caveman
+check_fail 'older --no-headroom flag is rejected' full_sync_start 0 "" --no-headroom
 check_fail 'unknown flag is rejected' full_sync_start 0 "" --bogus
 
 control_lock_check() (
   HOME="$(mktemp -d)"
   trap 'rm -rf "$HOME"' EXIT
   control_probe() {
-    python3 - "$HOME/.headroom/watchdog-state.control.lock" <<'PY'
+    python3 - "$CAVEMAN_HOME/ats-control.lock" <<'PY'
 import fcntl, os, sys
 try:
     os.fstat(9)
@@ -181,11 +134,11 @@ with open(sys.argv[1], "a") as lock:
 PY
   }
   proxy_control_run control_probe || return 1
-  python3 - "$HOME/.headroom/watchdog-state.control.lock" <<'PY'
+  python3 - "$CAVEMAN_HOME/ats-control.lock" <<'PY'
 import fcntl, sys
 with open(sys.argv[1], "a") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 PY
 )
-check 'shutdown retains watchdog lock throughout child work, then releases it' control_lock_check
+check 'shutdown retains the control lock throughout child work, then releases it' control_lock_check
 report

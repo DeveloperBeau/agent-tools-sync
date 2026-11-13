@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # agent-tools-sync — install / update / wire up the local agent-efficiency
-# toolkit (headroom, rtk, caveman, ponytail, optional Ship) for both agents.
+# toolkit (rtk, caveman, ponytail, optional Ship) for both agents.
 #
 # Safe to re-run any time: every step checks current state first and only
 # acts when something is actually missing or out of date.
@@ -25,15 +25,13 @@ unset _src _dir
 
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
-if [ "${1:-}" != kill ] && [ "${1:-}" != start ] && [ "${1:-}" != watchdog ]; then
+if [ "${1:-}" != kill ] && [ "${1:-}" != start ]; then
   if ats_check_update "$SCRIPT_DIR"; then
     :
   elif [ "$?" -eq 2 ]; then
     exec "$SCRIPT_DIR/agent-tools-sync.sh" "$@"
   fi
 fi
-# shellcheck source=lib/headroom.sh
-source "$SCRIPT_DIR/lib/headroom.sh"
 # shellcheck source=lib/rtk.sh
 source "$SCRIPT_DIR/lib/rtk.sh"
 # shellcheck source=lib/xcsift.sh
@@ -64,13 +62,9 @@ source "$SCRIPT_DIR/lib/serena.sh"
 source "$SCRIPT_DIR/lib/obsidian.sh"
 
 # caveman owns :8787 as the only proxy either agent's base URL points at.
-# headroom gets its own port and sits downstream of caveman in the chain
-# (agent -> caveman -> headroom -> provider) — see lib/caveman.sh.
-HEADROOM_PORT="${HEADROOM_PORT:-8788}"
 
-# cmd_kill — stops all persistent background servers (caveman :8787,
-# headroom :$HEADROOM_PORT, claude-mem's worker daemon) and confirms neither
-# fixed-port proxy is still listening.
+# cmd_kill — stops all persistent background servers (caveman :8787 and
+# claude-mem's worker daemon) and confirms the proxy port is closed.
 cmd_kill() {
   section "kill"
   proxy_suspend || return 1
@@ -80,19 +74,16 @@ cmd_kill() {
 cmd_kill_services() {
   local failed=0
   caveman_stop_proxy || failed=1
-  headroom_stop_proxy || failed=1
   claude_mem_stop_worker || failed=1
 
   sleep 1  # give the sockets a moment to actually release
-  local alive=0 port
-  for port in 8787 "$HEADROOM_PORT"; do
-    if port_listening "$port"; then
-      warn "port $port still listening"; alive=1
-    elif [ "$?" != 1 ]; then
-      warn "cannot inspect port $port"; alive=1
-    fi
-  done
-  if [ "$alive" -eq 0 ]; then ok "no agent-tools servers listening on 8787 or $HEADROOM_PORT"; fi
+  local alive=0
+  if port_listening 8787; then
+    warn "port 8787 still listening"; alive=1
+  elif [ "$?" != 1 ]; then
+    warn "cannot inspect port 8787"; alive=1
+  fi
+  if [ "$alive" -eq 0 ]; then ok "no agent-tools servers listening on 8787"; fi
   [ "$alive" -eq 0 ] && [ "$failed" -eq 0 ]
 }
 
@@ -104,16 +95,13 @@ cmd_start() {
   claude_mem_start_worker
 }
 
-# stop_unused_proxies — stops each proxy that the current mode does not use.
+# stop_unused_proxies — stops the proxy when the current mode does not use it.
 stop_unused_proxies() {
-  local failed=0
-  ats_uses headroom || headroom_stop_proxy || failed=1
-  ats_uses caveman || caveman_stop_proxy || failed=1
-  [ "$failed" -eq 0 ]
+  ats_uses caveman || caveman_stop_proxy
 }
 
 usage() {
-  echo "usage: agent-tools-sync [--no-headroom] [--no-caveman] | kill | start | watchdog capture|fire" >&2
+  echo "usage: agent-tools-sync [--no-wrap] | kill | start" >&2
   return 1
 }
 
@@ -121,40 +109,23 @@ main() {
   case "${1:-}" in
     kill) cmd_kill; return ;;
     start) cmd_start; return ;;
-    watchdog)
-      case "${2:-}" in
-        capture|fire) [ "$#" -eq 2 ] || return 1; python3 "$SCRIPT_DIR/lib/proxy_watchdog.py" "$2"; return ;;
-        *) echo "usage: ats watchdog [capture|fire]" >&2; return 1 ;;
-      esac ;;
   esac
 
-  local no_headroom=false no_caveman=false mode=full arg
+  local mode=full arg
   for arg in "$@"; do
     case "$arg" in
-      --no-headroom) no_headroom=true ;;
-      --no-caveman) no_caveman=true ;;
+      --no-wrap) mode=direct ;;
       *) usage; return ;;
     esac
   done
-  case "$no_headroom:$no_caveman" in
-    true:true) mode=direct ;;
-    true:false) mode=no-headroom ;;
-    false:true) mode=no-caveman ;;
-  esac
 
   proxy_resume || return 1
   ats_set_mode "$mode" || return 1
-  ats_uses headroom && setup_headroom
   setup_rtk
   setup_xcsift
   setup_search_tools
   setup_grepai
-  if ats_uses caveman; then
-    setup_caveman
-  elif ! python3 "$CAVEMAN_PROXY_INSTALLER" >/dev/null; then
-    # The wrapper update makes Caveman's native hooks honor the mode.
-    warn "Caveman wrapper refresh failed; its hooks may restart the proxy"
-  fi
+  ats_uses caveman && setup_caveman
   setup_ponytail
   setup_evolver
   setup_claude_mem
@@ -169,14 +140,10 @@ main() {
   bash "$SCRIPT_DIR/proxy-chain.sh" start || return 1
   section "done"
   case "$mode" in
-    full)
-      echo "  caveman    → both agents' base URL, proxy on :8787, chains to headroom"
-      echo "  headroom   → downstream compression hop on :$HEADROOM_PORT, on-demand MCP in Claude Code" ;;
-    no-headroom) echo "  caveman    → both agents' base URL on :8787, native routes; headroom stopped" ;;
-    no-caveman) echo "  headroom   → both agents' base URL on :$HEADROOM_PORT; caveman proxy stopped" ;;
-    direct) echo "  proxies    → none; both agents call their provider directly" ;;
+    full) echo "  caveman    → both agents' base URL, proxy on :8787, native routes" ;;
+    direct) echo "  proxies    → none; both agents call their provider directly (Claude Remote Control works)" ;;
   esac
-  [ "$mode" = full ] || echo "  Run plain 'ats' to restore the full caveman → headroom chain."
+  [ "$mode" = full ] || echo "  Run plain 'ats' to restore the Caveman proxy."
   echo "  rtk        → shell-output hook in both Claude Code and Codex"
   echo "  xcsift     → compact xcodebuild/swift build output in Claude Code"
   echo "  search     → ripgrep, fd, sd and ast-grep for fast code search and rewriting"

@@ -130,4 +130,11 @@ ship_other_swift_commands_stay() (
 )
 check "Other swift commands stay unchanged" ship_other_swift_commands_stay
 
+check "ship_developer_dir: a set DEVELOPER_DIR wins" bash -c '
+  source "$1"; [ "$(DEVELOPER_DIR=/custom ship_developer_dir)" = /custom ]' bash "$HERE/../lib/ship.sh"
+check "ship_developer_dir: otherwise the plain Xcode.app" bash -c '
+  source "$1"; unset DEVELOPER_DIR
+  [ ! -d /Applications/Xcode.app/Contents/Developer ] ||
+    [ "$(ship_developer_dir)" = /Applications/Xcode.app/Contents/Developer ]' bash "$HERE/../lib/ship.sh"
+
 report
