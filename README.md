@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/DeveloperBeau/agent-tools-sync/main
 bash /tmp/agent-tools-sync-install.sh
 ```
 
-The wizard installs Homebrew, Git, Node.js, Python, uv, and Bun when missing. It asks separately whether to install Claude Code and Codex; both default to no. It then clones ATS into `~/.local/share/agent-tools-sync`, adds `agent-tools-sync` to `~/.local/bin`, and runs the sync. Open a new terminal before using the command. Agent sign-in happens in each agent's own CLI.
+The wizard installs Homebrew, Git, Node.js, Python, uv, and Bun when missing. It asks separately whether to install Claude Code and Codex; both default to no. It then clones ATS into `~/.local/share/agent-tools-sync`, adds `agent-tools-sync` to `~/.local/bin`, and runs the sync. It also adds the short command `ats` unless that name is already taken (a command, alias or function), and then says so. It offers to add `~/.local/bin` to your `PATH` in `~/.zshrc` (zsh) or `~/.bash_profile` (bash), and prints the line for other shells. Open a new terminal before using the command. Agent sign-in happens in each agent's own CLI.
 
 For a manual checkout instead:
 
@@ -41,10 +41,10 @@ mkdir -p ~/.local/bin
 ln -s "$(pwd)/agent-tools-sync/agent-tools-sync.sh" ~/.local/bin/agent-tools-sync
 ```
 
-Add an alias if you want the short form:
+For the short form, link it the same way (skip it if `ats` is already in use):
 
 ```sh
-echo 'alias ats="agent-tools-sync"' >> ~/.zshrc
+ln -s "$(pwd)/agent-tools-sync/agent-tools-sync.sh" ~/.local/bin/ats
 ```
 
 You can copy the directory to another machine and symlink the entry point. The script resolves `lib/*.sh` from its own location.

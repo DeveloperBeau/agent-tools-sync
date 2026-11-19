@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import pty
 import select
+import subprocess
 import tempfile
 import time
 
@@ -59,7 +60,7 @@ esac
 """)
 
     env = dict(os.environ, HOME=str(home), TEST_BIN=str(fakebin),
-               PATH=f"{fakebin}:/usr/bin:/bin")
+               PATH=f"{fakebin}:/usr/bin:/bin", SHELL="/bin/zsh")
     pid, terminal = pty.fork()
     if pid == 0:
         os.execvpe("bash", ["bash", str(installer)], env)
@@ -86,6 +87,9 @@ esac
         if b"Install Codex? [y/N]" in output and "codex" not in answered:
             os.write(terminal, b"n\n")
             answered.add("codex")
+        if b"in ~/.zshrc? [Y/n]" in output and "path" not in answered:
+            os.write(terminal, b"\n")
+            answered.add("path")
     else:
         os.kill(pid, 9)
         raise AssertionError("installer timed out")
@@ -95,4 +99,24 @@ esac
     assert "brew install --cask claude-code" in (home / "steps").read_text()
     assert "brew install --cask codex" not in (home / "steps").read_text()
     assert (home / ".local/bin/agent-tools-sync").is_symlink()
-    assert 'export PATH="$HOME/.local/bin:$PATH"' in (home / ".zprofile").read_text()
+    assert (home / ".local/bin/ats").is_symlink()
+    assert 'export PATH="$HOME/.local/bin:$PATH"' in (home / ".zshrc").read_text()
+    assert not (home / ".zprofile").exists()
+    assert b"ats is taken" not in output
+
+
+# A different tool already named ats is left alone and reported.
+with tempfile.TemporaryDirectory() as directory:
+    home = Path(directory) / "home"
+    (home / ".local/bin").mkdir(parents=True)
+    other = Path(directory) / "other"
+    executable(other, "exit 0\n")
+    (home / ".local/bin/ats").symlink_to(other)
+    source = installer.read_text()
+    function = source[source.index("link_shorthand() {"):source.index("# Offer to put")]
+    result = subprocess.run(
+        ["bash", "-c", function + "\nCHECKOUT=/x link_shorthand"],
+        env=dict(os.environ, HOME=str(home), SHELL="/bin/sh"),
+        capture_output=True, text=True)
+    assert "ats is taken, so you need to use agent-tools-sync." in result.stdout, result
+    assert (home / ".local/bin/ats").resolve() == other.resolve()
