@@ -9,14 +9,17 @@ BIN="$HOME/.local/bin/agent-tools-sync"
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
-ask_agent() {
-  local answer
+# ask_yes_no PROMPT DEFAULT(y|n): read an answer from the terminal on fd 3.
+ask_yes_no() {
+  local answer hint='[y/N]'
+  [ "$2" = y ] && hint='[Y/n]'
   while :; do
-    printf 'Install %s? [y/N] ' "$1" >&2
+    printf '%s %s ' "$1" "$hint" >&2
     IFS= read -r answer <&3 || die "could not read terminal"
     case "$answer" in
       y|Y|[Yy][Ee][Ss]) return 0 ;;
-      ''|n|N|[Nn][Oo]) return 1 ;;
+      n|N|[Nn][Oo]) return 1 ;;
+      '') [ "$2" = y ]; return ;;
       *) printf 'Enter y or n.\n' >&2 ;;
     esac
   done
@@ -55,9 +58,44 @@ install_agent() {
   local command_name="$1" cask="$2" label="$3"
   if command -v "$command_name" >/dev/null 2>&1; then
     printf '%s already installed.\n' "$label"
-  elif ask_agent "$label"; then
+  elif ask_yes_no "Install $label?" n; then
     brew install --cask "$cask"
     command -v "$command_name" >/dev/null 2>&1 || die "$label unavailable after installation"
+  fi
+}
+
+# Add the short name `ats` unless something already uses it. An alias or
+# function only shows in an interactive shell, so ask the login shell too.
+link_shorthand() {
+  local short="$HOME/.local/bin/ats"
+  if [ -L "$short" ] && [ "$(readlink "$short")" = "$CHECKOUT/agent-tools-sync.sh" ]; then
+    return 0
+  fi
+  if [ -e "$short" ] || [ -L "$short" ] ||
+     command -v ats >/dev/null 2>&1 ||
+     "${SHELL:-/bin/sh}" -ic 'command -v ats' </dev/null >/dev/null 2>&1; then
+    printf 'ats is taken, so you need to use agent-tools-sync.\n'
+  else
+    ln -s "$CHECKOUT/agent-tools-sync.sh" "$short"
+    printf 'Added the short command ats.\n'
+  fi
+}
+
+# Offer to put ~/.local/bin on PATH in the rc file of the user's shell.
+offer_path_setup() {
+  local line='export PATH="$HOME/.local/bin:$PATH"' rc tilde='~'
+  case "${SHELL##*/}" in
+    zsh) rc="$HOME/.zshrc" ;;
+    bash) rc="$HOME/.bash_profile" ;;
+    *) printf 'Add this line to your shell startup file:\n  %s\n' "$line"; return 0 ;;
+  esac
+  if grep -Fq '.local/bin' "$rc" "$HOME/.zprofile" "$HOME/.bashrc" 2>/dev/null; then
+    return 0
+  fi
+  if ask_yes_no "Add ~/.local/bin to PATH in ${rc/#$HOME/$tilde}?" y; then
+    printf '\n%s\n' "$line" >>"$rc"
+  else
+    printf 'Add this line to %s yourself:\n  %s\n' "$rc" "$line"
   fi
 }
 
@@ -99,12 +137,11 @@ main() {
   else
     ln -s "$CHECKOUT/agent-tools-sync.sh" "$BIN"
   fi
-  if ! grep -Fqx 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.zprofile" 2>/dev/null; then
-    printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >>"$HOME/.zprofile"
-  fi
+  link_shorthand
+  offer_path_setup
   export PATH="$HOME/.local/bin:$PATH"
   "$BIN"
-  printf '\nInstalled ATS. Open a new terminal, then run agent-tools-sync anytime.\n'
+  printf '\nInstalled ATS. Open a new terminal, then run agent-tools-sync (or ats, if it was added) anytime.\n'
 }
 
 main "$@"
